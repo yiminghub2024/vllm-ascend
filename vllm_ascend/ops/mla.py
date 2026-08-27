@@ -77,6 +77,11 @@ class AscendMultiHeadLatentAttention(MultiHeadLatentAttentionWrapper):
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
         skip_topk: bool = False,
+        # Upstream fuses the q_a/kv_a RMSNorms on the CUDA path. On Ascend the
+        # whole MLA preprocess runs inside the attention impl, which receives
+        # both layernorms as extra args, so this flag has no effect here and is
+        # accepted for signature compatibility only.
+        fuse_qkv_rmsnorm: bool = False,
     ) -> None:
         nn.Module.__init__(self)
         self.hidden_size = hidden_size

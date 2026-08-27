@@ -46,6 +46,10 @@ class AscendMLAAttentionSpec(MLAAttentionSpec):
     # indexer spec.
     cache_sparse_sfa_c8: bool = False
     store_on_host: bool = False
+    # Hybrid GLM (MLA + KDA/Mamba + kpool) pages do not evenly divide.
+    # Ascend binds KV as block-first views and indexes padded pages by
+    # runtime block stride, so unify_kv_cache_spec_page_size may pad.
+    indexes_kv_by_block_stride: bool = True
 
     @property
     def storage_block_size(self) -> int:
@@ -54,11 +58,15 @@ class AscendMLAAttentionSpec(MLAAttentionSpec):
 
     @property
     def page_size_bytes(self) -> int:
-        return (
+        real = (
             self.storage_block_size
             * self.num_kv_heads
             * (self.head_size * get_dtype_size(self.dtype) + self.scale_dim * get_dtype_size(self.scale_dtype))
         )
+        if self.page_size_padded is not None:
+            assert self.page_size_padded >= real
+            return self.page_size_padded
+        return real
 
     @classmethod
     def merge(cls, specs: list[Self]) -> Self:
@@ -103,6 +111,8 @@ class AscendMLAAttentionSpec(MLAAttentionSpec):
             compress_ratio=specs[0].compress_ratio,
             cache_sparse_sfa_c8=specs[0].cache_sparse_sfa_c8,
             store_on_host=store_on_host_set.pop(),
+            page_size_padded=specs[0].page_size_padded,
+            indexes_kv_by_block_stride=specs[0].indexes_kv_by_block_stride,
         )
 
     def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
