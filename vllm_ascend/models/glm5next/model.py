@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from collections.abc import Iterable
-from typing import ClassVar, Literal
+from typing import Any, ClassVar, Literal
 
 import torch
 from torch import nn
@@ -666,7 +666,9 @@ class Glm5NextModel(nn.Module):
         hidden_states = self.norm(hidden_states)
         return hidden_states
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+    # Entries are (name, weight) or (name, weight, kwargs); the optional third
+    # element carries per-weight loader arguments used by the fused FP8 paths.
+    def load_weights(self, weights: Iterable[tuple[Any, ...]]) -> set[str]:
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             (".gate_up_proj", ".gate_proj", 0),

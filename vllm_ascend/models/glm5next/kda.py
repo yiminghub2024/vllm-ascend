@@ -56,6 +56,10 @@ class _Glm5NextMergedColumnParallelLinear(MergedColumnParallelLinear):
     loading for replicated shards.
     """
 
+    # Owned by the base class; declared here so the temporary override in the
+    # weight loaders below does not read the attribute before its type is known.
+    tp_rank: int
+
     def __init__(
         self,
         input_size: int,

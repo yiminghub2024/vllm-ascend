@@ -426,7 +426,7 @@ class Glm5NextVisionTransformer(nn.Module):
         return self.patch_embed.proj.weight.device
 
     def rot_pos_emb(self, grid_thw: list[list[int]]) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        pos_ids = []
+        pos_ids_per_grid = []
         for t, h, w in grid_thw:
             hpos_ids = torch.arange(h).unsqueeze(1).expand(-1, w)
             wpos_ids = torch.arange(w).unsqueeze(0).expand(h, -1)
@@ -450,8 +450,8 @@ class Glm5NextVisionTransformer(nn.Module):
                 .permute(0, 2, 1, 3)
                 .flatten()
             )
-            pos_ids.append(torch.stack([hpos_ids, wpos_ids], dim=-1).repeat(t, 1))
-        pos_ids = torch.cat(pos_ids, dim=0)
+            pos_ids_per_grid.append(torch.stack([hpos_ids, wpos_ids], dim=-1).repeat(t, 1))
+        pos_ids = torch.cat(pos_ids_per_grid, dim=0)
         max_grid_size = max(max(h, w) for _, h, w in grid_thw)
 
         cos, sin = self.rotary_pos_emb.get_cos_sin(max_grid_size)
