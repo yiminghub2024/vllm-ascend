@@ -25,7 +25,10 @@ from unittest.mock import MagicMock, patch
 import pytest
 from vllm.config import CUDAGraphMode
 
-from vllm_ascend.spec_decode.llm_base_proposer import AscendSpecDecodeBaseProposer
+from vllm_ascend.spec_decode.llm_base_proposer import (
+    AscendSpecDecodeBaseProposer,
+    _draft_embed_accepts_mm,
+)
 
 # CUDAGraphMode values whose ``has_full_cudagraphs()`` is True: FULL plus the
 # two composite modes that mix FULL with NONE / PIECEWISE.
@@ -215,3 +218,36 @@ class TestDisablePaddedDrafterBatchWithFullGraph:
         )
 
         proposer._raise_if_padded_drafter_batch_disabled_and_full_graph_enabled()
+
+
+class TestDraftEmbedMmSupport:
+    """Text-only MTP heads such as Glm5NextMTP expose ``embed_input_ids``
+    without multimodal parameters, so forwarding a multimodal target model's
+    multimodal kwargs to them raises ``TypeError``.
+    """
+
+    def test_head_taking_multimodal_embeddings_accepts_mm(self):
+        def embed_input_ids(input_ids, multimodal_embeddings=None):
+            return input_ids
+
+        assert _draft_embed_accepts_mm(embed_input_ids) is True
+
+    def test_text_only_head_does_not_accept_mm(self):
+        def embed_input_ids(input_ids):
+            return input_ids
+
+        assert _draft_embed_accepts_mm(embed_input_ids) is False
+
+    @pytest.mark.parametrize("error", [TypeError("C-bound callable"), ValueError("no signature found")])
+    def test_uninspectable_callable_is_treated_as_text_only(self, error: Exception):
+        """Falling back to text-only cannot raise, whereas assuming multimodal
+        support and forwarding the kwargs to a head that rejects them would.
+        """
+
+        def embed_input_ids(input_ids, multimodal_embeddings=None):
+            return input_ids
+
+        with patch("vllm_ascend.spec_decode.llm_base_proposer._inspect") as fake_inspect:
+            fake_inspect.signature.side_effect = error
+
+            assert _draft_embed_accepts_mm(embed_input_ids) is False

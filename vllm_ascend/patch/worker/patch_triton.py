@@ -108,8 +108,14 @@ try:
     import sys as _sys
 
     for _m in list(_sys.modules.values()):
-        if getattr(_m, "fused_q_kv_rmsnorm", None) not in (None, _npu_fused_q_kv_rmsnorm):
-            _m.fused_q_kv_rmsnorm = _npu_fused_q_kv_rmsnorm  # type: ignore[attr-defined]
+        try:
+            if getattr(_m, "fused_q_kv_rmsnorm", None) not in (None, _npu_fused_q_kv_rmsnorm):
+                _m.fused_q_kv_rmsnorm = _npu_fused_q_kv_rmsnorm  # type: ignore[attr-defined]
+        except Exception:
+            # Lazy loaders, frozen modules and C extensions may refuse the
+            # attribute read or the assignment. Skipping them keeps the sweep
+            # going for the modules that do hold the CUDA kernel.
+            continue
 except ImportError:
     pass
 
@@ -349,9 +355,14 @@ try:
     _gis_mod.gather_initial_states = _npu_gather_initial_states
     _scs_mod.scatter_states = _npu_scatter_states
     for _m in list(_sys_ms.modules.values()):
-        if getattr(_m, "gather_initial_states", None) not in (None, _npu_gather_initial_states):
-            _m.gather_initial_states = _npu_gather_initial_states  # type: ignore[attr-defined]
-        if getattr(_m, "scatter_states", None) not in (None, _npu_scatter_states):
-            _m.scatter_states = _npu_scatter_states  # type: ignore[attr-defined]
+        try:
+            if getattr(_m, "gather_initial_states", None) not in (None, _npu_gather_initial_states):
+                _m.gather_initial_states = _npu_gather_initial_states  # type: ignore[attr-defined]
+            if getattr(_m, "scatter_states", None) not in (None, _npu_scatter_states):
+                _m.scatter_states = _npu_scatter_states  # type: ignore[attr-defined]
+        except Exception:
+            # Same reasoning as the vision-tower sweep above: a module that
+            # rejects attribute access must not stop the remaining rebinds.
+            continue
 except ImportError:
     pass

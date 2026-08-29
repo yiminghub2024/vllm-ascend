@@ -2394,7 +2394,13 @@ def _draft_embed_accepts_mm(embed_fn) -> bool:
     key = getattr(embed_fn, "__func__", embed_fn)
     cached = _DRAFT_EMBED_MM_SUPPORT.get(key)
     if cached is None:
-        cached = "multimodal_embeddings" in _inspect.signature(embed_fn).parameters
+        try:
+            cached = "multimodal_embeddings" in _inspect.signature(embed_fn).parameters
+        except (TypeError, ValueError):
+            # C-bound callables and some test doubles reject introspection.
+            # Treat them as text-only: that is the side that cannot raise
+            # TypeError, since it only means the mm kwargs are not forwarded.
+            cached = False
         _DRAFT_EMBED_MM_SUPPORT[key] = cached
     return cached
 
