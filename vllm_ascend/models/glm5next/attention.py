@@ -11,7 +11,6 @@ from vllm.config import (
 from vllm.distributed import (
     get_tensor_model_parallel_world_size,
 )
-from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import LayerNorm, RMSNorm
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
@@ -39,8 +38,6 @@ from vllm_ascend.models.glm5next.sparse_attn_indexer_kpool import SparseAttnInde
 # Paged MQA page sizes the kpool tail cache aligns against. Upstream reads this
 # from `vllm.utils.deep_gemm`, which is a CUDA-only module on Ascend.
 PAGED_MQA_PAGE_SIZES = (32, 64)
-
-logger = init_logger(__name__)
 
 # Shared torch.compile config for the indexer's small-kernel leaves. The MLA
 # indexer runs under breakable-CG (CompilationMode.NONE), which blocks FX-graph

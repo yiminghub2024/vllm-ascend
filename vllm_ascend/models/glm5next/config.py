@@ -2,9 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from transformers.configuration_utils import PretrainedConfig
-from vllm.logger import init_logger
-
-logger = init_logger(__name__)
 
 
 class Glm5NextTextConfig(PretrainedConfig):

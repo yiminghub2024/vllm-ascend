@@ -17,10 +17,8 @@ a CUDA-only kernel.
 """
 
 import torch
-from vllm.logger import init_logger
+from vllm.logger import logger
 from vllm.model_executor.custom_op import CustomOp
-
-logger = init_logger(__name__)
 
 _UNSUPPORTED_MESSAGE = (
     "GLM-5.3-Flash sparse (kpool) attention indexing is not implemented on "

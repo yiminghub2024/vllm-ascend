@@ -14,7 +14,6 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
 )
-from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul, SiluAndMulWithClamp
 from vllm.model_executor.layers.fused_moe import (
     FusedMoEFactory,
@@ -89,8 +88,6 @@ from .multimodal import (
     Glm5NextVisionTransformer,
 )
 from .ops.mhc_ops import hc_contract, hc_expand
-
-logger = init_logger(__name__)
 
 
 class Glm5NextMLP(nn.Module):
