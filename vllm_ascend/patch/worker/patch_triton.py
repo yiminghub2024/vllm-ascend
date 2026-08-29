@@ -34,7 +34,8 @@ def _npu_causal_conv1d_update(*args, **kwargs):
 
 # npu_kda_causal_conv1d_bind: CUDA causal_conv1d kernels use tl.extra.cuda.gdc_wait
 # which Ascend Triton does not provide. Swap the NPU update kernel and a PyTorch
-# prefill fn, then rebind GLM KDA from-imports.
+# prefill fn. Models that live in vllm-ascend import the Ascend entry points
+# directly and do not rely on this rebind.
 _CC1D_FN_DROP = (
     "null_block_id",
     "block_idx_first_scheduled_token",
@@ -54,13 +55,6 @@ def _npu_causal_conv1d_fn(*args, metadata=None, **kwargs):
 
 _cc1d.causal_conv1d_update = _npu_causal_conv1d_update
 _cc1d.causal_conv1d_fn = _npu_causal_conv1d_fn
-try:
-    import vllm.models.glm5next.nvidia.kda as _glm_kda  # type: ignore[import-not-found]
-
-    _glm_kda.causal_conv1d_update = _npu_causal_conv1d_update
-    _glm_kda.causal_conv1d_fn = _npu_causal_conv1d_fn
-except ImportError:
-    pass
 
 fla_layernorm_guard.LayerNormFn = LayerNormFn
 fla_ops.chunk_gated_delta_rule = chunk_gated_delta_rule
@@ -326,12 +320,6 @@ try:
     )
 
     _cc1d.causal_conv1d_update = _cc1d_update_npu
-    try:
-        import vllm.models.glm5next.nvidia.kda as _glm_kda_triton
-
-        _glm_kda_triton.causal_conv1d_update = _cc1d_update_npu
-    except ImportError:
-        pass
     print("[npu_kda_causal_conv1d_triton] bound NPU Triton causal_conv1d_update", flush=True)
 except Exception as _cc1d_err:
     print("[npu_kda_causal_conv1d_triton] FAILED:", repr(_cc1d_err), flush=True)
