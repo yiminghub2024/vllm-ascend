@@ -17,10 +17,10 @@ that up front instead of hanging during capture.
 
 import torch
 
-from vllm_ascend._310p.ops.causal_conv1d import (
+from vllm_ascend.ops.causal_conv1d import (
     causal_conv1d_fn as _torch_causal_conv1d_fn,
 )
-from vllm_ascend._310p.ops.causal_conv1d import (
+from vllm_ascend.ops.causal_conv1d import (
     causal_conv1d_update as _torch_causal_conv1d_update,
 )
 

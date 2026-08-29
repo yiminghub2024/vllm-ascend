@@ -542,16 +542,23 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             else:
                 # mtp_head_tied_share: GLM-5.3-Flash omits shared_head.head from
                 # the checkpoint and ties it to the target lm_head, so the
-                # equality test never fires and the draft head stays
-                # uninitialised. Share whenever the shapes line up.
+                # weights never compare equal and the draft head would stay
+                # uninitialised. Only a tied architecture may therefore share on
+                # a shape match alone. Every other MTP checkpoint keeps the
+                # value-equality test: an independently trained draft head of
+                # the same shape must not be silently replaced by the target
+                # lm_head, which would cost acceptance rate with nothing in the
+                # logs to explain it.
+                model_type = str(getattr(self.vllm_config.model_config.hf_config, "model_type", ""))
+                draft_head_is_tied = model_type.startswith("glm5_next")
                 for _, layer_module in self.model.model.layers.items():
                     shared_head = getattr(layer_module, "shared_head", None)
+                    if shared_head is None:
+                        continue
                     draft_head = getattr(shared_head, "head", None)
-                    if (
-                        shared_head is not None
-                        and draft_head is not None
-                        and draft_head.weight.shape == target_lm_head.weight.shape
-                    ):
+                    if draft_head is None or draft_head.weight.shape != target_lm_head.weight.shape:
+                        continue
+                    if draft_head_is_tied or torch.equal(draft_head.weight, target_lm_head.weight):
                         shared_head.head = target_lm_head
 
         if self.vllm_config.compilation_config.cudagraph_mode.has_full_cudagraphs() and self.use_cuda_graph:

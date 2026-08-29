@@ -23,6 +23,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
+import torch
 from vllm.config import CUDAGraphMode
 
 from vllm_ascend.spec_decode.llm_base_proposer import (
@@ -218,6 +219,72 @@ class TestDisablePaddedDrafterBatchWithFullGraph:
         )
 
         proposer._raise_if_padded_drafter_batch_disabled_and_full_graph_enabled()
+
+
+class TestMtpSharedHeadSharing:
+    """``_maybe_share_lm_head`` may only replace an MTP draft head with the
+    target ``lm_head`` when the checkpoint ties the two. GLM-5.3-Flash omits
+    ``shared_head.head`` entirely, so it needs a shape-only match; any other MTP
+    checkpoint may ship an independently trained head of the same shape, which
+    must be left alone or acceptance rate silently drops.
+    """
+
+    @staticmethod
+    def _make_proposer(model_type: str) -> AscendSpecDecodeBaseProposer:
+        proposer = AscendSpecDecodeBaseProposer.__new__(AscendSpecDecodeBaseProposer)
+        proposer.method = "mtp"
+        proposer.vllm_config = SimpleNamespace(
+            model_config=SimpleNamespace(
+                is_deepseek_mla=True,
+                hf_config=SimpleNamespace(model_type=model_type),
+            ),
+            compilation_config=SimpleNamespace(cudagraph_mode=CUDAGraphMode.NONE),
+        )
+        proposer.use_cuda_graph = False
+        return proposer
+
+    def _share(self, model_type: str, draft_weight: torch.Tensor, target_weight: torch.Tensor):
+        """Return (resulting draft head, target head) after sharing runs."""
+        proposer = self._make_proposer(model_type)
+        layers = {"0": SimpleNamespace(shared_head=SimpleNamespace(head=SimpleNamespace(weight=draft_weight)))}
+        proposer.model = SimpleNamespace(model=SimpleNamespace(layers=layers))
+        target_lm_head = SimpleNamespace(weight=target_weight)
+
+        proposer._maybe_share_lm_head(SimpleNamespace(lm_head=target_lm_head))
+
+        return layers["0"].shared_head.head, target_lm_head
+
+    @pytest.mark.parametrize("model_type", ["glm5_next", "glm5_next_text"])
+    def test_tied_architecture_shares_on_shape_match_alone(self, model_type: str):
+        """GLM's draft head is uninitialised, so equal weights never happen."""
+        draft_head, target_lm_head = self._share(model_type, torch.zeros(4, 3), torch.ones(4, 3))
+
+        assert draft_head is target_lm_head
+
+    def test_other_mtp_keeps_independently_trained_head(self):
+        draft_head, target_lm_head = self._share("deepseek_v3", torch.zeros(4, 3), torch.ones(4, 3))
+
+        assert draft_head is not target_lm_head
+        assert torch.equal(draft_head.weight, torch.zeros(4, 3))
+
+    def test_other_mtp_still_shares_identical_weights(self):
+        """The upstream value-equality behaviour must be preserved."""
+        draft_head, target_lm_head = self._share("deepseek_v3", torch.ones(4, 3), torch.ones(4, 3))
+
+        assert draft_head is target_lm_head
+
+    @pytest.mark.parametrize("model_type", ["glm5_next", "deepseek_v3"])
+    def test_shape_mismatch_never_shares(self, model_type: str):
+        draft_head, target_lm_head = self._share(model_type, torch.zeros(5, 3), torch.ones(4, 3))
+
+        assert draft_head is not target_lm_head
+
+    def test_layer_without_shared_head_is_skipped(self):
+        proposer = self._make_proposer("glm5_next")
+        proposer.model = SimpleNamespace(model=SimpleNamespace(layers={"0": SimpleNamespace()}))
+
+        # Must not raise.
+        proposer._maybe_share_lm_head(SimpleNamespace(lm_head=SimpleNamespace(weight=torch.ones(4, 3))))
 
 
 class TestDraftEmbedMmSupport:

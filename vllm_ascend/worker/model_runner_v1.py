@@ -149,6 +149,7 @@ from vllm_ascend.eplb.core.eplb_device_transfer_loader import D2DExpertWeightLoa
 from vllm_ascend.eplb.core.eplb_worker import EplbProcess
 from vllm_ascend.eplb.eplb_updator import EplbUpdator
 from vllm_ascend.model_executor.offloader import create_offloader
+from vllm_ascend.models.glm5next.kv_cache import KpoolTailSpec
 from vllm_ascend.ops.rotary_embedding import set_cos_and_sin, update_cos_sin
 from vllm_ascend.ops.triton.spec_decode.ngram import triton_ngram_spec_decode
 from vllm_ascend.quantization.utils import enable_fa_quant
@@ -4059,7 +4060,7 @@ class NPUModelRunner(GPUModelRunner):
         static_ctx = getattr(compilation_config, "static_forward_context", {}) if compilation_config else {}
         if is_glm5_next_kpool_cache(static_ctx.get(layer_name)):
             return True
-        return spec is not None and type(spec).__name__ == "KpoolTailSpec"
+        return isinstance(spec, KpoolTailSpec)
 
     def _get_attention_kv_cache_dims(self, layer_name: str, kv_cache_spec: AttentionSpec) -> tuple[int, int]:
         if isinstance(kv_cache_spec, AscendMLAAttentionSpec):
