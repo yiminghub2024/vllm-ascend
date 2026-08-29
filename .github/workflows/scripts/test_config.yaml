@@ -61,6 +61,9 @@
   optional: false
   source_file_dependencies:
     - vllm_ascend/_310p
+    # Shared PyTorch conv1d reference kept outside _310p so GLM5Next can
+    # reuse it; 310P remains its main consumer via the patch_triton fallback.
+    - vllm_ascend/ops/causal_conv1d.py
   tests:
     - tests/ut/_310p
     - tests/e2e/pull_request/one_card/_310p
