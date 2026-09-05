@@ -54,6 +54,7 @@ from vllm_ascend.core.kv_cache_interface import (
     AscendMLAAttentionSpec,
     AscendSFAIndexerCacheSpec,
     AscendSlidingWindowMLASpec,
+    block_stride_indexing_kwargs,
 )
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 from vllm_ascend.quantization.utils import enable_fa_quant
@@ -169,7 +170,7 @@ def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
             kv_cache_spec[layer_name] = replace(
                 spec,
                 page_size_padded=page_size_padded,
-                indexes_kv_by_block_stride=True,
+                **block_stride_indexing_kwargs(True),
             )
         for layer_name, spec in mamba_specs.items():
             if spec.page_size_bytes < common_page_size:

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, fields, replace
 
 import torch
 from typing_extensions import Self
@@ -17,6 +17,21 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
+
+_SPEC_HAS_BLOCK_STRIDE_INDEXING = any(f.name == "indexes_kv_by_block_stride" for f in fields(MLAAttentionSpec))
+
+
+def block_stride_indexing_kwargs(enabled: bool) -> dict[str, bool]:
+    """Spec kwargs opting padded pages into block-stride KV indexing.
+
+    vLLM dropped the flag when it made ``storage_block_size`` an explicit spec
+    field, so on those versions the storage block the spec already carries
+    describes the layout and there is nothing to opt into. Detect the field
+    rather than the version: the release axis and the currently pinned main
+    commit both predate the removal, so a version check cannot tell them apart
+    from a newer main.
+    """
+    return {"indexes_kv_by_block_stride": enabled} if _SPEC_HAS_BLOCK_STRIDE_INDEXING else {}
 
 
 def get_storage_block_size(kv_cache_spec: KVCacheSpec) -> int:
@@ -95,7 +110,7 @@ class AscendMLAAttentionSpec(MLAAttentionSpec):
             alignment=first_spec.alignment,
             cache_sparse_sfa_c8=first_spec.cache_sparse_sfa_c8,
             store_on_host=first_spec.store_on_host,
-            indexes_kv_by_block_stride=first_spec.indexes_kv_by_block_stride,
+            **block_stride_indexing_kwargs(getattr(first_spec, "indexes_kv_by_block_stride", False)),
         )
 
     def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:

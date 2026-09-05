@@ -230,6 +230,7 @@ from vllm_ascend.core.kv_cache_interface import (
     AscendMLAAttentionSpec,
     AscendSFAIndexerCacheSpec,
     AscendSlidingWindowMLASpec,
+    block_stride_indexing_kwargs,
 )
 
 # if true, allow tensor initialization and casting with internal format (e.g., NZ)
@@ -5302,7 +5303,7 @@ class NPUModelRunner(GPUModelRunner):
                         # evenly divide. Ascend binds KV as block-first views
                         # and indexes padded pages by runtime block stride, so
                         # unify_kv_cache_spec_page_size may pad them.
-                        indexes_kv_by_block_stride=model_uses_kpool_indexer(self.model_config),
+                        **block_stride_indexing_kwargs(model_uses_kpool_indexer(self.model_config)),
                     )
                     attn_layer_names.add(layer_name)
 
@@ -5314,7 +5315,7 @@ class NPUModelRunner(GPUModelRunner):
                         # Indexer/tail pages do not evenly divide the MLA page.
                         # Ascend indexes KV by block stride, so opt in to padding.
                         if isinstance(spec, AttentionSpec):
-                            spec = replace(spec, indexes_kv_by_block_stride=True)
+                            spec = replace(spec, **block_stride_indexing_kwargs(True))
                         kv_cache_spec[layer_name] = spec
                     continue
                 # TODO: This mirrors upstream's separated KV/indexer specs for
