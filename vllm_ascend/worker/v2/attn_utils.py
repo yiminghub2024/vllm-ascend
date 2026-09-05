@@ -63,6 +63,7 @@ from vllm_ascend.utils import (
     calc_split_factor,
     enable_sfa,
     enable_sfa_dcp_replicated_indexer,
+    model_uses_kpool_indexer,
 )
 
 if TYPE_CHECKING:
@@ -159,7 +160,13 @@ def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
             attention_layer_names.append(layer_name)
             continue
 
-    if mamba_specs:
+    if mamba_specs and model_uses_kpool_indexer(vllm_config.model_config):
+        # GLM-5.3-Flash unifies its own pages: the kpool grouping path pads the
+        # KDA state page up to the MLA page and aliases the indexer and tail
+        # pages into the attention group, so it rejects attention specs that
+        # arrive already padded.
+        kv_cache_spec.update(mamba_specs)
+    elif mamba_specs:
         common_page_size = max(spec.page_size_bytes for spec in (*kv_cache_spec.values(), *mamba_specs.values()))
         for layer_name in attention_layer_names:
             spec = kv_cache_spec[layer_name]

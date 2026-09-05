@@ -5377,10 +5377,16 @@ class NPUModelRunner(GPUModelRunner):
                 if spec := mamba_module.get_kv_cache_spec(self.vllm_config):
                     kv_cache_spec[layer_name] = spec
                     mamba_page_size_padded = spec.page_size_bytes
-            # align attn_page_size to mamba_page_size_padded
-            for layer_name in attn_layer_names:
-                if kv_cache_spec[layer_name].page_size_bytes < mamba_page_size_padded:  # type: ignore[attr-defined]
-                    object.__setattr__(kv_cache_spec[layer_name], "page_size_padded", mamba_page_size_padded)
+            # GLM-5.3-Flash unifies its own pages: the kpool grouping path pads
+            # the KDA state page up to the MLA page and aliases the indexer and
+            # tail pages into the attention group, so it rejects attention specs
+            # that arrive already padded. Padding here aborts KV cache setup
+            # before that grouping ever runs.
+            if not model_uses_kpool_indexer(self.model_config):
+                # align attn_page_size to mamba_page_size_padded
+                for layer_name in attn_layer_names:
+                    if kv_cache_spec[layer_name].page_size_bytes < mamba_page_size_padded:  # type: ignore[attr-defined]
+                        object.__setattr__(kv_cache_spec[layer_name], "page_size_padded", mamba_page_size_padded)
 
         if self.sparse_kv_offload_enabled:
             self.kv_cache_spec = kv_cache_spec # reserve for Sparse KV offload usage
