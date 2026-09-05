@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from collections import defaultdict
 from dataclasses import dataclass, replace
 
 import torch
@@ -11,12 +12,63 @@ from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager, SlidingWindowManager
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
+    KVCacheConfig,
     KVCacheSpec,
     MLAAttentionSpec,
     SlidingWindowMLASpec,
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
+
+
+@dataclass(frozen=True)
+class AliasedKVCacheTensor:
+    """One allocation together with every layer that shares its bytes."""
+
+    size: int
+    shared_by: list[str]
+
+
+def aliased_kv_cache_tensors(
+    kv_cache_config: KVCacheConfig,
+) -> list[AliasedKVCacheTensor]:
+    """Describe the KV cache allocation as sets of layers that share bytes.
+
+    vLLM used to say this directly: a ``KVCacheTensor`` was one allocation of
+    ``size`` bytes plus the ``shared_by`` layers that alias it. It now describes
+    placements into a common backing allocation instead -- layer ``l`` of an
+    entry starts at ``offset + l * layer_stride``, and aliasing is expressed by
+    two placements landing on the same address rather than by a shared list.
+
+    Recover the old view, which is what the allocator below still wants: expand
+    each entry to one placement per layer, then group the placements by address.
+    Layers at the same address are exactly the old ``shared_by`` set -- for
+    GLM-5.3-Flash that is each MLA layer overlaid with its Mamba partner, and
+    each indexer layer overlaid with its kpool tail.
+    """
+    tensors = kv_cache_config.kv_cache_tensors
+    if not tensors or hasattr(tensors[0], "shared_by"):
+        return tensors
+
+    num_blocks = kv_cache_config.num_blocks
+    layers_at: dict[int, list[str]] = defaultdict(list)
+    bytes_at: dict[int, int] = {}
+    for tensor in tensors:
+        layer_bytes = num_blocks * tensor.block_stride
+        assert len(tensor.layers) == 1 or tensor.layer_stride == layer_bytes, (
+            "Ascend's KV cache allocator only handles layer-outermost layouts, "
+            f"got layer_stride={tensor.layer_stride} for {len(tensor.layers)} "
+            f"layers of {layer_bytes} bytes each."
+        )
+        for index, layer_name in enumerate(tensor.layers):
+            offset = tensor.offset + index * tensor.layer_stride
+            layers_at[offset].append(layer_name)
+            bytes_at[offset] = max(bytes_at.get(offset, 0), layer_bytes)
+
+    return [
+        AliasedKVCacheTensor(size=bytes_at[offset], shared_by=layers)
+        for offset, layers in layers_at.items()
+    ]
 
 
 def get_storage_block_size(kv_cache_spec: KVCacheSpec) -> int:

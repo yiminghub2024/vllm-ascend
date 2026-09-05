@@ -230,6 +230,7 @@ from vllm_ascend.core.kv_cache_interface import (
     AscendMLAAttentionSpec,
     AscendSFAIndexerCacheSpec,
     AscendSlidingWindowMLASpec,
+    aliased_kv_cache_tensors,
 )
 
 # if true, allow tensor initialization and casting with internal format (e.g., NZ)
@@ -4395,7 +4396,7 @@ class NPUModelRunner(GPUModelRunner):
         # the same tensor format must be maintained even if some layers
         # have only linear or attention layers, for example, the mtp layer.
         self.hybrid_with_attn_and_mamba = False
-        for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
+        for kv_cache_tensor in aliased_kv_cache_tensors(kv_cache_config):
             use_mamba, use_attn = False, False
             for layer_name in kv_cache_tensor.shared_by:
                 if isinstance(layer_kv_cache_spec[layer_name], MambaSpec):
