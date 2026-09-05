@@ -764,6 +764,11 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
                 # the checkpoint. Skip them.
                 continue
 
+            if not self.is_v32 and ".indexer." in name:
+                # Dense NoPE MLA (``index_topk`` unset) builds no indexer, so
+                # the checkpoint's indexer tensors have no parameter to land in.
+                continue
+
             # Handle FP8 indexer WK: dequantize to BF16 for fusion with
             # weights_proj into wk_weights_proj.
             if _try_load_fp8_indexer_wk(

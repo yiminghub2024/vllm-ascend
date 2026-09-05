@@ -185,9 +185,9 @@ from vllm_ascend.utils import (
     global_stream,
     is_hidden_state_cache_spec,
     is_score_encoder_cache_manager,
+    kpool_indexer_is_active,
     kv_cache_spec_uses_sparse_sfa_c8,
     lmhead_tp_enable,
-    model_uses_kpool_indexer,
     oproj_tp_enable,
     set_potential_max_tokens,
     should_skip_allreduce_across_dp_group,
@@ -5313,7 +5313,7 @@ class NPUModelRunner(GPUModelRunner):
                         # evenly divide. Ascend binds KV as block-first views
                         # and indexes padded pages by runtime block stride, so
                         # unify_kv_cache_spec_page_size may pad them.
-                        **block_stride_indexing_kwargs(model_uses_kpool_indexer(self.model_config)),
+                        **block_stride_indexing_kwargs(kpool_indexer_is_active(self.model_config)),
                     )
                     attn_layer_names.add(layer_name)
 
@@ -5378,11 +5378,13 @@ class NPUModelRunner(GPUModelRunner):
                 if spec := mamba_module.get_kv_cache_spec(self.vllm_config):
                     kv_cache_spec[layer_name] = spec
                     mamba_page_size_padded = spec.page_size_bytes
-            # align attn_page_size to mamba_page_size_padded. The kpool
+            # align attn_page_size to mamba_page_size_padded. An active kpool
             # indexer is excluded: vLLM lays those groups out itself and
             # requires the attention specs to reach it unpadded, so padding
-            # here would trip its assertion instead of helping.
-            if not model_uses_kpool_indexer(self.model_config):
+            # here would trip its assertion instead of helping. A kpool-shaped
+            # checkpoint served dense (``index_topk`` unset) registers no
+            # indexer layers, never reaches that layout, and still needs this.
+            if not kpool_indexer_is_active(self.model_config):
                 for layer_name in attn_layer_names:
                     if kv_cache_spec[layer_name].page_size_bytes < mamba_page_size_padded:  # type: ignore[attr-defined]
                         object.__setattr__(kv_cache_spec[layer_name], "page_size_padded", mamba_page_size_padded)

@@ -127,6 +127,23 @@ def model_uses_kpool_indexer(model_config: Any | None) -> bool:
     return any(hasattr(getattr(model_config, attr, None), "index_kpool") for attr in ("hf_text_config", "hf_config"))
 
 
+def kpool_indexer_is_active(model_config: Any | None) -> bool:
+    """Return True when the kpool indexer contributes KV cache specs.
+
+    ``model_uses_kpool_indexer`` only says the checkpoint is kpool-shaped: the
+    config carries ``index_kpool`` either way. The indexer itself is built --
+    and its k_cache / tail_cache layers registered -- only when ``index_topk``
+    is set. Leaving it unset runs the model as dense NoPE MLA, and then the
+    cache layout must follow the ordinary hybrid MLA + Mamba path.
+    """
+    if not model_uses_kpool_indexer(model_config):
+        return False
+    return any(
+        getattr(getattr(model_config, attr, None), "index_topk", None) is not None
+        for attr in ("hf_text_config", "hf_config")
+    )
+
+
 def model_uses_sfa_sparse(model_config: Any | None) -> bool:
     hf_text_config = getattr(model_config, "hf_text_config", None)
     hf_config = getattr(model_config, "hf_config", None)
