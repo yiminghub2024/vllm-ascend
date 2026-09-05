@@ -224,6 +224,9 @@ class CandidateSelector(nn.Module):
 
 
 class DFlash2Qwen3Model(DFlashQwen3Model):
+    # vLLM main builds the layers through this hook (upstream PR 52816).
+    decoder_layer_cls = DFlash2Qwen3DecoderLayer
+
     def __init__(
         self,
         *,
@@ -233,8 +236,9 @@ class DFlash2Qwen3Model(DFlashQwen3Model):
     ) -> None:
         import vllm.model_executor.models.qwen3_dflash as dflash_mod
 
-        # Upstream PR 52816 adds decoder_layer_cls; until that pin lands, swap
-        # the parent ctor's global so it builds DFlash2 layers.
+        # 0.27.1 predates decoder_layer_cls and reads the module global instead,
+        # so swap it for the duration of the parent ctor. A no-op on main, where
+        # the class attribute above wins.
         original_layer = dflash_mod.DFlashQwen3DecoderLayer
         dflash_mod.DFlashQwen3DecoderLayer = DFlash2Qwen3DecoderLayer
         try:
@@ -268,10 +272,13 @@ class DFlash2Qwen3Model(DFlashQwen3Model):
 class DFlash2Qwen3ForCausalLM(DFlashQwen3ForCausalLM):
     # Share the target LM head so compute_candidates can top-k the full vocab.
     has_own_lm_head = False
+    # vLLM main builds the inner model through this hook (upstream PR 52816).
+    model_cls = DFlash2Qwen3Model
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         import vllm.model_executor.models.qwen3_dflash as dflash_mod
 
+        # Same 0.27.1 fallback as DFlash2Qwen3Model.decoder_layer_cls.
         original_model = dflash_mod.DFlashQwen3Model
         dflash_mod.DFlashQwen3Model = DFlash2Qwen3Model
         try:
