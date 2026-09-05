@@ -231,6 +231,8 @@ from vllm_ascend.core.kv_cache_interface import (
     AscendSFAIndexerCacheSpec,
     AscendSlidingWindowMLASpec,
     aliased_kv_cache_tensors,
+    block_stride_indexing_kwargs,
+    get_storage_block_size,
 )
 
 # if true, allow tensor initialization and casting with internal format (e.g., NZ)
@@ -4650,8 +4652,9 @@ class NPUModelRunner(GPUModelRunner):
                     assert num_blocks == kv_cache_config.num_blocks, \
                         f"num_blocks: {num_blocks} should be equal to " \
                         f"kv_cache_config.num_blocks: {kv_cache_config.num_blocks}"
+                    storage_block_size = get_storage_block_size(current_kv_cache_spec)
                     kv_cache_shape = self.attn_backend.get_kv_cache_shape(
-                        num_blocks, current_kv_cache_spec.storage_block_size,
+                        num_blocks, storage_block_size,
                         current_kv_cache_spec.num_kv_heads,
                         current_kv_cache_spec.head_size)
                     kv_cache_shape_list = [kv_cache_shape]
@@ -4661,13 +4664,13 @@ class NPUModelRunner(GPUModelRunner):
                     if hasattr(current_kv_cache_spec, "scale_dim") and current_kv_cache_spec.scale_dim != 0:
                         indexer_k_shape = kv_cache_shape
                         indexer_scale_shape = self.attn_backend.get_kv_cache_shape(
-                                                num_blocks, current_kv_cache_spec.storage_block_size,
+                                                num_blocks, storage_block_size,
                                                 current_kv_cache_spec.num_kv_heads,
                                                 current_kv_cache_spec.scale_dim
                                                 )
                         if get_current_hardware_profile().supports(HardwareCapability.DSV4_COMPRESSED_CACHE):
                             indexer_full_shape = self.attn_backend.get_kv_cache_shape(
-                                num_blocks, current_kv_cache_spec.storage_block_size,
+                                num_blocks, storage_block_size,
                                 current_kv_cache_spec.num_kv_heads,
                                 current_kv_cache_spec.head_size
                                 + current_kv_cache_spec.scale_dim
@@ -5310,7 +5313,7 @@ class NPUModelRunner(GPUModelRunner):
                         # evenly divide. Ascend binds KV as block-first views
                         # and indexes padded pages by runtime block stride, so
                         # unify_kv_cache_spec_page_size may pad them.
-                        indexes_kv_by_block_stride=model_uses_kpool_indexer(self.model_config),
+                        **block_stride_indexing_kwargs(model_uses_kpool_indexer(self.model_config)),
                     )
                     attn_layer_names.add(layer_name)
 
@@ -5322,7 +5325,7 @@ class NPUModelRunner(GPUModelRunner):
                         # Indexer/tail pages do not evenly divide the MLA page.
                         # Ascend indexes KV by block stride, so opt in to padding.
                         if isinstance(spec, AttentionSpec):
-                            spec = replace(spec, indexes_kv_by_block_stride=True)
+                            spec = replace(spec, **block_stride_indexing_kwargs(True))
                         kv_cache_spec[layer_name] = spec
                     continue
                 # TODO: This mirrors upstream's separated KV/indexer specs for
