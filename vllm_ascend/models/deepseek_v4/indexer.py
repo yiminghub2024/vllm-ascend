@@ -96,7 +96,7 @@ class AscendDeepseekV4IndexerCache(DeepseekV4IndexerCache):
             if not is_a5_bf16_kv_enabled(vllm_config):
                 vllm_config.cache_config.cache_dtype = "float8_e4m3fn"
 
-        from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec
+        from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec, compression_kwargs
         from vllm_ascend.models.layer.attention.layer import DSV4_BLOCK_SIZES
 
         storage_block_size = DSV4_BLOCK_SIZES[vllm_config.cache_config.block_size][0][0]
@@ -106,12 +106,12 @@ class AscendDeepseekV4IndexerCache(DeepseekV4IndexerCache):
             head_size=self.head_dim,
             dtype=self.dtype,
             model_version="deepseek_v4",
-            compress_ratio=self.compress_ratio,
             cache_dtype_str=self.cache_config.cache_dtype,
             scale_dim=1 if self.head_dim == 128 else 0,
             scale_dtype=torch.float
             if get_current_hardware_profile().supports(HardwareCapability.DSV4_COMPRESSED_CACHE)
             else torch.float16,
+            **compression_kwargs(self.compress_ratio),
         )
 
     def forward(self): ...

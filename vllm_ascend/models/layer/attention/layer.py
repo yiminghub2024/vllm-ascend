@@ -25,7 +25,7 @@ from vllm_ascend.attention.dsa_v1 import (
     AscendDSAC128Backend,
     AscendDSASWABackend,
 )
-from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec
+from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec, compression_kwargs
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 
 
@@ -209,6 +209,6 @@ class DSAAttention(nn.Module, AttentionLayerBase):
             head_size=cached_head_size,
             dtype=kv_cache_dtype,
             model_version="deepseek_v4",
-            compress_ratio=self.compress_ratio,
             cache_dtype_str=vllm_config.cache_config.cache_dtype,
+            **compression_kwargs(self.compress_ratio),
         )

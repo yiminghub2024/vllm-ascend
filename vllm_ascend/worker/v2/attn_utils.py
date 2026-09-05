@@ -54,6 +54,8 @@ from vllm_ascend.core.kv_cache_interface import (
     AscendMLAAttentionSpec,
     AscendSFAIndexerCacheSpec,
     AscendSlidingWindowMLASpec,
+    block_stride_indexing_kwargs,
+    get_storage_block_size,
 )
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 from vllm_ascend.quantization.utils import enable_fa_quant
@@ -169,7 +171,7 @@ def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
             kv_cache_spec[layer_name] = replace(
                 spec,
                 page_size_padded=page_size_padded,
-                indexes_kv_by_block_stride=True,
+                **block_stride_indexing_kwargs(True),
             )
         for layer_name, spec in mamba_specs.items():
             if spec.page_size_bytes < common_page_size:
@@ -436,9 +438,10 @@ def _view_dsv4_cache(
     if num_blocks != kv_cache_config.num_blocks:
         raise ValueError(f"DSA cache has {num_blocks} blocks, expected {kv_cache_config.num_blocks}.")
 
+    storage_block_size = get_storage_block_size(kv_cache_spec)
     k_shape = attn_backend.get_kv_cache_shape(
         num_blocks,
-        kv_cache_spec.storage_block_size,
+        storage_block_size,
         kv_cache_spec.num_kv_heads,
         kv_cache_spec.head_size,
     )
@@ -451,7 +454,7 @@ def _view_dsv4_cache(
         scale_dtype = kv_cache_spec.scale_dtype
         scale_shape = attn_backend.get_kv_cache_shape(
             num_blocks,
-            kv_cache_spec.storage_block_size,
+            storage_block_size,
             kv_cache_spec.num_kv_heads,
             scale_dim,
         )
@@ -460,7 +463,7 @@ def _view_dsv4_cache(
         if get_current_hardware_profile().supports(HardwareCapability.DSV4_COMPRESSED_CACHE):
             full_shape = attn_backend.get_kv_cache_shape(
                 num_blocks,
-                kv_cache_spec.storage_block_size,
+                storage_block_size,
                 kv_cache_spec.num_kv_heads,
                 kv_cache_spec.head_size + scale_dim * get_dtype_size(scale_dtype),
             )
@@ -759,9 +762,10 @@ def _reshape_kv_cache_v2(
             continue
 
         group_spec = group.kv_cache_spec
+        group_storage_block_size = get_storage_block_size(group_spec)
         kernel_block_size = (
-            group_spec.storage_block_size
-            if group_spec.storage_block_size != group_spec.block_size
+            group_storage_block_size
+            if group_storage_block_size != group_spec.block_size
             else kernel_block_sizes[group.kv_cache_group_id]
         )
 
@@ -847,7 +851,7 @@ def _reshape_kv_cache_v2(
             if total_bytes % kv_cache_spec.page_size_bytes:
                 raise ValueError(f"KV cache for {layer_name} is not a whole number of pages.")
             num_blocks = total_bytes // kv_cache_spec.page_size_bytes
-            num_blocks_per_kv_block = kv_cache_spec.storage_block_size // kernel_block_size
+            num_blocks_per_kv_block = get_storage_block_size(kv_cache_spec) // kernel_block_size
             kernel_num_blocks = num_blocks * num_blocks_per_kv_block
             kv_cache_shape = group.backend.get_kv_cache_shape(
                 kernel_num_blocks,
