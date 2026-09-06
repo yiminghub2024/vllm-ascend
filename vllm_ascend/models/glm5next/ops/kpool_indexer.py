@@ -30,6 +30,53 @@ from vllm_ascend.models.glm5next.ops.kpool_compress import (
     shared_pool_prefix,
 )
 
+# npu_lightning_indexer reports the key page's pool axis as ``block_size`` and
+# requires it to be a multiple of 16 in (0, 1024]. A 160-pool page (block_size
+# 640, index_kpool 4) is valid; a 165-pool page is not.
+LIGHTNING_INDEXER_POOLS_ALIGNMENT = 16
+LIGHTNING_INDEXER_MAX_POOLS = 1024
+
+
+def pa_bsnd_keys(index_cache: torch.Tensor, head_dim: int) -> torch.Tensor:
+    """View the pooled key cache as ``[blocks, pools, 1, head_dim]``.
+
+    ``DeepseekV32IndexerCache.bind_kv_cache`` squeezes a size-1 head axis at
+    dim 1, so the tensor may arrive as ``[blocks, pools, C]`` or as
+    ``[blocks, pools, 1, C]``. Inferring the pool axis with ``view(..., -1,
+    1, head_dim)`` is unsafe: a 132-wide FP8-plus-scale page (160 cells)
+    viewed as 128-wide bf16 becomes 165 pools, which the operator then
+    rejects as ``block_size must be a multiple of 16``.
+    """
+    if index_cache.ndim == 3:
+        index_cache = index_cache.unsqueeze(2)
+    if index_cache.ndim != 4:
+        raise RuntimeError(f"kpool indexer key cache must be 3-D or 4-D PA_BSND, got {tuple(index_cache.shape)}")
+
+    _, dim1, dim2, content = index_cache.shape
+    if dim2 == 1:
+        pools = dim1
+    elif dim1 == 1:
+        pools = dim2
+        index_cache = index_cache.permute(0, 2, 1, 3).contiguous()
+    else:
+        raise RuntimeError(f"kpool indexer key cache needs a size-1 head axis, got {tuple(index_cache.shape)}")
+
+    if content != head_dim:
+        inferred_pools = index_cache.numel() // (index_cache.shape[0] * head_dim)
+        raise RuntimeError(
+            f"kpool indexer key cache content width is {content}, expected "
+            f"{head_dim}. Viewing that page as {head_dim}-wide would invent "
+            f"{inferred_pools} pools (165 for a 160-pool FP8-plus-scale page) "
+            "and npu_lightning_indexer would reject the shape."
+        )
+    if pools % LIGHTNING_INDEXER_POOLS_ALIGNMENT != 0 or not (0 < pools <= LIGHTNING_INDEXER_MAX_POOLS):
+        raise RuntimeError(
+            "npu_lightning_indexer requires the key block_size (pools per page) "
+            f"to be a multiple of {LIGHTNING_INDEXER_POOLS_ALIGNMENT} in "
+            f"(0, {LIGHTNING_INDEXER_MAX_POOLS}], got {pools}."
+        )
+    return index_cache
+
 
 def score_and_select_pools(
     query: torch.Tensor,
@@ -112,6 +159,8 @@ def select_token_ids(
         each request's start, padded with -1.
     """
     assert topk_tokens % pool_size == 0, (topk_tokens, pool_size)
+
+    index_cache = pa_bsnd_keys(index_cache, query.shape[-1])
 
     # The MLA metadata builder keeps these two on the host, but the operator
     # rejects length arguments that do not sit with its other tensors. Both are

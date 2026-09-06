@@ -9,6 +9,8 @@ import pytest
 import torch
 
 from vllm_ascend.models.glm5next.ops.kpool_indexer import (
+    LIGHTNING_INDEXER_POOLS_ALIGNMENT,
+    pa_bsnd_keys,
     row_seq_lens,
     select_token_ids,
     tail_width_for,
@@ -138,3 +140,57 @@ def test_selected_ids_are_causal_and_cover_the_recent_run(query_lens, fake_opera
 def test_row_sequence_lengths_count_back_from_the_step():
     per_row = row_seq_lens(torch.tensor([21, 33]), torch.tensor([1, 4]))
     torch.testing.assert_close(per_row, torch.tensor([21, 30, 31, 32, 33]))
+
+
+def test_pa_bsnd_keeps_the_pool_axis():
+    keys = torch.zeros(2, 160, 1, HEAD_DIM, dtype=torch.bfloat16)
+    viewed = pa_bsnd_keys(keys, HEAD_DIM)
+    assert viewed.shape == (2, 160, 1, HEAD_DIM)
+
+    squeezed = keys.squeeze(2)
+    assert squeezed.shape == (2, 160, HEAD_DIM)
+    assert pa_bsnd_keys(squeezed, HEAD_DIM).shape == (2, 160, 1, HEAD_DIM)
+
+
+def test_pa_bsnd_does_not_invent_pools_from_an_fp8_wide_page():
+    """160 cells of width 132, viewed as 128, is 165 -- not a multiple of 16."""
+    packed = torch.zeros(2, 160, 1, 132, dtype=torch.bfloat16)
+    assert packed.numel() // (2 * HEAD_DIM) == 165
+    assert 165 % LIGHTNING_INDEXER_POOLS_ALIGNMENT != 0
+
+    with pytest.raises(RuntimeError, match="content width is 132"):
+        pa_bsnd_keys(packed, HEAD_DIM)
+
+    # The shape that actually reached npu_lightning_indexer before this guard.
+    invented = packed.view(packed.shape[0], -1, 1, HEAD_DIM)
+    assert invented.shape == (2, 165, 1, HEAD_DIM)
+    with pytest.raises(RuntimeError, match="got 165"):
+        pa_bsnd_keys(invented, HEAD_DIM)
+
+
+def test_indexer_cache_is_constructed_at_the_logical_head_dim():
+    """Do not pass the FP8-plus-scale width (head_dim + 4) into the cache."""
+    import ast
+    from pathlib import Path
+
+    source = (Path(__file__).resolve().parents[3] / "vllm_ascend" / "models" / "glm5next" / "attention.py").read_text(
+        encoding="utf-8"
+    )
+    tree = ast.parse(source)
+    widened = False
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        name = func.id if isinstance(func, ast.Name) else getattr(func, "attr", None)
+        if name != "Glm5NextIndexerCache":
+            continue
+        for keyword in node.keywords:
+            if keyword.arg != "head_dim":
+                continue
+            widened = isinstance(keyword.value, ast.BinOp)
+    assert not widened, (
+        "Glm5NextIndexerCache must be constructed with the logical head_dim; "
+        "widening it by the FP8 scale bytes made npu_lightning_indexer see "
+        "165 pools on a 160-pool page."
+    )

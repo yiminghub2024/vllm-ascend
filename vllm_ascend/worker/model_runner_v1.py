@@ -4275,13 +4275,13 @@ class NPUModelRunner(GPUModelRunner):
         attn_backend,
         kv_cache_spec: AttentionSpec,
         num_blocks: int,
-        storage_block_size: int,
+        states_per_block: int,
     ) -> tuple[int, ...]:
         """Ask the indexer backend for its cache shape, dtype hint optional."""
         try:
             return attn_backend.get_kv_cache_shape(
                 num_blocks,
-                storage_block_size,
+                states_per_block,
                 kv_cache_spec.num_kv_heads,
                 kv_cache_spec.head_size,
                 cache_dtype_str=getattr(kv_cache_spec, "cache_dtype_str", "auto") or "auto",
@@ -4289,7 +4289,7 @@ class NPUModelRunner(GPUModelRunner):
         except TypeError:
             return attn_backend.get_kv_cache_shape(
                 num_blocks,
-                storage_block_size,
+                states_per_block,
                 kv_cache_spec.num_kv_heads,
                 kv_cache_spec.head_size,
             )
@@ -4775,9 +4775,6 @@ class NPUModelRunner(GPUModelRunner):
                     )
                     num_blocks = raw_tensor.numel() // page_size_bytes
                     assert num_blocks >= kv_cache_config.num_blocks
-                    storage_block_size = getattr(
-                        current_kv_cache_spec, "storage_block_size", current_kv_cache_spec.block_size
-                    )
                     if isinstance(current_kv_cache_spec, KpoolTailSpec):
                         # KpoolTailBackend publishes no shape of its own: the
                         # ring's layout is the generic
@@ -4791,8 +4788,16 @@ class NPUModelRunner(GPUModelRunner):
                             current_kv_cache_spec.head_size,
                         )
                     else:
+                        # The indexer page holds one cell per pool, i.e.
+                        # block_size // index_kpool of them, which is exactly
+                        # what page_size_bytes above was derived from. Viewing
+                        # it by anything else leaves a cache the operators
+                        # cannot address.
                         kv_cache_shape = self._kpool_indexer_cache_shape(
-                            attn_backend, current_kv_cache_spec, num_blocks, storage_block_size
+                            attn_backend,
+                            current_kv_cache_spec,
+                            num_blocks,
+                            current_kv_cache_spec.num_states,
                         )
                     raw_typed = raw_tensor.view(current_kv_cache_spec.dtype)
                     page_size_padded = getattr(current_kv_cache_spec, "page_size_padded", None)

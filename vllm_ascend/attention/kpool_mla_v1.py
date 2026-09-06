@@ -247,8 +247,7 @@ class AscendKpoolMLAImpl(AscendMLAImpl):
         return select_token_ids(
             self._project_indexer_query(hidden_states),
             (weights * self.index_weight_scale).to(key.dtype),
-            # PA_BSND wants an explicit single-head axis.
-            index_cache.view(index_cache.shape[0], -1, 1, self.index_head_dim),
+            index_cache,
             block_table=block_table,
             query_lens=query_lens,
             seq_lens=seq_lens,
