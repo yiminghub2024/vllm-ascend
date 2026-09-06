@@ -164,7 +164,8 @@ def expand_pools_and_append_tail(
 
     Args:
         pool_ids: ``[rows, topk_tokens // pool_size]`` -- selected pools per
-            query row, negative where top-k found fewer pools than the budget.
+            query row. Slots past what the row was offered hold whatever top-k
+            padded with, which is not assumed to be negative.
         seq_lens: ``[rows]`` -- token-granular sequence length per query row.
         pool_size: tokens per pool (the checkpoint's ``index_kpool``).
         selectable_pools: ``[rows]`` -- how many leading pools were offered to
@@ -185,10 +186,19 @@ def expand_pools_and_append_tail(
     rows, num_groups = pool_ids.shape
     device = pool_ids.device
 
+    seq_lens = seq_lens.to(torch.int64).unsqueeze(-1)
+    offered = seq_lens // pool_size if selectable_pools is None else selectable_pools.to(torch.int64).unsqueeze(-1)
+
     pool_ids = pool_ids.to(torch.int64).unsqueeze(-1)
     slot_offsets = torch.arange(pool_size, device=device)
     history = pool_ids * pool_size + slot_offsets
-    history = torch.where(pool_ids >= 0, history, -1).reshape(rows, num_groups * pool_size)
+    # Top-k fills the slots beyond the offered prefix itself, and what it fills
+    # them with is not part of the contract. Bound the ids by what the request
+    # was actually allowed to select instead of trusting a negative pad: an id
+    # at or past that count names a pool the request never had, and expanding
+    # it points the attention at tokens whose KV was never written.
+    in_range = (pool_ids >= 0) & (pool_ids < offered.unsqueeze(-1))
+    history = torch.where(in_range, history, -1).reshape(rows, num_groups * pool_size)
 
     if tail_width is None:
         tail_width = pool_size - 1
@@ -197,11 +207,7 @@ def expand_pools_and_append_tail(
         # there is nothing left over to append.
         return history.to(torch.int32)
 
-    seq_lens = seq_lens.to(torch.int64).unsqueeze(-1)
-    if selectable_pools is None:
-        tail_start = (seq_lens // pool_size) * pool_size
-    else:
-        tail_start = selectable_pools.to(torch.int64).unsqueeze(-1) * pool_size
+    tail_start = offered * pool_size
     tail_offsets = torch.arange(tail_width, device=device)
     tail = torch.where(tail_offsets < seq_lens - tail_start, tail_start + tail_offsets, -1)
 

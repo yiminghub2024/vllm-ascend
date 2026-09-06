@@ -51,13 +51,16 @@ def _reference_expand(
     expanded = []
     for row in range(rows):
         seq_len = int(seq_lens[row])
-        tail_start = (seq_len // pool_size) * pool_size
+        offered = seq_len // pool_size
+        tail_start = offered * pool_size
         tail_count = seq_len - tail_start
 
         columns = []
         for column in range(topk):
             pool_id = int(pool_ids[row, column // pool_size])
-            columns.append(pool_id * pool_size + column % pool_size if pool_id >= 0 else -1)
+            # A pool the row was never offered is padding whatever its value.
+            in_range = 0 <= pool_id < offered
+            columns.append(pool_id * pool_size + column % pool_size if in_range else -1)
         for offset in range(pool_size - 1):
             columns.append(tail_start + offset if offset < tail_count else -1)
         expanded.append(columns)
@@ -215,10 +218,39 @@ def test_unfilled_budget_slots_expand_to_padding() -> None:
     pool_size = 4
     pool_ids = torch.tensor([[3, -1, -1]], dtype=torch.int32)
 
-    expanded = expand_pools_and_append_tail(pool_ids, torch.tensor([12]), pool_size)
+    # seq_len 16, not 12: pool 3 holds tokens 12..15, so a row that knows only
+    # 12 tokens was never offered it and the expansion is right to drop it.
+    expanded = expand_pools_and_append_tail(pool_ids, torch.tensor([16]), pool_size)
 
     torch.testing.assert_close(expanded[0, :4], torch.tensor([12, 13, 14, 15], dtype=torch.int32))
     assert torch.all(expanded[0, 4:12] == -1)
+
+
+@pytest.mark.parametrize("pad", [-1, 5, 7, 1_000_000])
+def test_padding_past_the_offered_prefix_is_dropped_whatever_its_value(pad: int) -> None:
+    """What top-k fills the unused budget with is not part of its contract.
+
+    A short history leaves nearly the whole budget unfilled, and taking those
+    slots at face value points the attention at tokens whose KV was never
+    written. Only an out-of-range fill can be recognised: a fill of 0 is
+    indistinguishable from a row that genuinely picked pool 0, and costs a
+    double-counted pool rather than a read of uninitialised memory.
+    """
+    pool_size = 4
+    # seq_len 22 offers pools 0..4. The row picked pool 3; the rest is fill.
+    pool_ids = torch.tensor([[3, pad, pad]], dtype=torch.int64)
+
+    expanded = expand_pools_and_append_tail(
+        pool_ids,
+        torch.tensor([22]),
+        pool_size,
+        selectable_pools=torch.tensor([5]),
+        tail_width=3,
+    )
+
+    torch.testing.assert_close(expanded[0, :4], torch.tensor([12, 13, 14, 15], dtype=torch.int32))
+    assert torch.all(expanded[0, 4:12] == -1)
+    torch.testing.assert_close(expanded[0, 12:], torch.tensor([20, 21, -1], dtype=torch.int32))
 
 
 def test_the_appended_tail_is_the_trailing_incomplete_pool() -> None:
