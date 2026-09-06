@@ -138,6 +138,15 @@ class AscendKpoolIndexerMetadataBuilder(AttentionMetadataBuilder[Any]):
 
     reorder_batch_threshold = None
 
+    def __init__(
+        self,
+        kv_cache_spec: AttentionSpec,
+        layer_names: list[str],
+        vllm_config: VllmConfig,
+        device: torch.device,
+    ):
+        super().__init__(kv_cache_spec, layer_names, vllm_config, device)
+
     @classmethod
     def get_cudagraph_support(
         cls,
