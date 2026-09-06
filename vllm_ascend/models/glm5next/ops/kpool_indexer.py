@@ -153,8 +153,12 @@ def select_token_ids(
         weights: ``[num_tokens, index_n_heads]``.
         index_cache: the pooled bf16 cache in PA_BSND layout.
         block_table: ``[num_requests, max_blocks]``.
-        query_lens: ``[num_requests]`` -- query rows per request this step.
-        seq_lens: ``[num_requests]`` -- tokens known after this step.
+        query_lens: ``[num_requests]`` -- query rows per request this step, on
+            ``query``'s device. Both length arguments have to be there already:
+            an H2D copy would record the host address it read during ACL-graph
+            capture and every replay would then read whatever occupies it.
+        seq_lens: ``[num_requests]`` -- tokens known after this step, likewise
+            on ``query``'s device.
         pool_size: the checkpoint's ``index_kpool``.
         topk_tokens: the checkpoint's ``index_topk``.
         max_query_len: the batch's widest request, taken from the attention
@@ -170,12 +174,13 @@ def select_token_ids(
 
     index_cache = pa_bsnd_keys(index_cache, query.shape[-1])
 
-    # The MLA metadata builder keeps these two on the host, but the operator
-    # rejects length arguments that do not sit with its other tensors. Both are
-    # one int per request, so the copy is small and asynchronous -- unlike a
-    # read in the other direction, which would stall the step.
-    query_lens = query_lens.to(query.device)
-    seq_lens = seq_lens.to(query.device)
+    # Copying a length in would work while eager and go silently wrong once
+    # captured, so refuse it at the boundary instead of reading a stale replay.
+    if query_lens.device != query.device or seq_lens.device != query.device:
+        raise RuntimeError(
+            "kpool selection needs its lengths on the query's device, got "
+            f"query_lens={query_lens.device}, seq_lens={seq_lens.device}, query={query.device}."
+        )
 
     selectable = shared_pool_prefix(seq_lens, query_lens, pool_size)
     pool_ids = score_and_select_pools(
@@ -263,7 +268,7 @@ def row_seq_lens(
         rows = request_index_per_row(query_lens, int(query_lens.sum()))
     query_lens = query_lens.to(torch.int64)
     starts = torch.cumsum(query_lens, 0) - query_lens
-    within = torch.arange(rows.shape[0], device=seq_lens.device) - starts[rows]
+    within = torch.arange(rows.shape[0], device=rows.device) - starts[rows]
     return (seq_lens[rows] - query_lens[rows] + 1 + within).to(seq_lens.dtype)
 
 

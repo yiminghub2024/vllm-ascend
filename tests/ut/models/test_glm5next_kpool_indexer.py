@@ -219,6 +219,44 @@ def test_kpool_ops_avoid_the_repeat_interleave_overload_without_an_npu_kernel():
     )
 
 
+def test_the_selection_chain_never_copies_a_length_onto_the_device():
+    """An H2D copy in this chain cannot survive ACL-graph capture.
+
+    Capture records the host address a copy reads, so a replay picks up
+    whatever occupies it by then rather than the current step's lengths. The
+    attention metadata does keep ``seq_lens`` on the host, which is why taking a
+    device from it is called out separately: the positions are the device-side
+    source to derive both lengths from.
+    """
+    import ast
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[3] / "vllm_ascend"
+    paths = sorted((root / "models" / "glm5next" / "ops").glob("*.py"))
+    paths.append(root / "attention" / "kpool_mla_v1.py")
+
+    def names_a_device(node) -> str:
+        """The tensor a ``<tensor>.device`` expression reads, if it is one."""
+        if not isinstance(node, ast.Attribute) or node.attr != "device":
+            return ""
+        return getattr(node.value, "attr", None) or getattr(node.value, "id", "")
+
+    offenders = []
+    for path in paths:
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            # `.to(dtype)` is free; `.to(other.device)` is the copy at issue.
+            if isinstance(node, ast.Call) and getattr(node.func, "attr", None) == "to":
+                if len(node.args) == 1 and names_a_device(node.args[0]):
+                    offenders.append(f"{path.name}:{node.lineno} copies across devices")
+            # Comparing or reporting a device is fine; placing a new tensor by
+            # one the metadata keeps on the host is what strands it there.
+            elif isinstance(node, ast.keyword) and node.arg == "device":
+                source = names_a_device(node.value)
+                if source.endswith("seq_lens"):
+                    offenders.append(f"{path.name}:{node.lineno} places a tensor by the host-side {source}")
+    assert not offenders, offenders
+
+
 def test_pa_bsnd_keeps_the_pool_axis():
     keys = torch.zeros(2, 160, 1, HEAD_DIM, dtype=torch.bfloat16)
     viewed = pa_bsnd_keys(keys, HEAD_DIM)

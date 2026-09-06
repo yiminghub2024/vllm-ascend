@@ -26,14 +26,8 @@ Where the metadata comes from, since three cache groups are involved:
 ``attn_metadata[tail_cache.prefix]``          tail ring slot mapping
 ============================================  ==============================
 
-Two deliberate limits of this first implementation:
+One deliberate limit of this first implementation:
 
-* Decode does not support ACL-graph capture. The dense path wraps its attention
-  call in graph-parameter bookkeeping so a captured graph can be replayed
-  against new operands, and the sparse call needs its own version of that.
-  Getting the numerics right is worth more than getting them fast, so the
-  builder reports ``NEVER`` and the runner keeps these layers eager rather than
-  capturing a graph that would replay stale pointers.
 * The indexer query re-runs the q-lora projection instead of reusing the one
   the MLA preprocess already computed, which costs one extra GEMM per sparse
   layer. The preprocess does not hand ``q_c`` back and it is shared with the
@@ -42,10 +36,7 @@ Two deliberate limits of this first implementation:
 
 import torch
 import torch.nn.functional as F
-from vllm.config import VllmConfig
 from vllm.forward_context import get_forward_context
-from vllm.v1.attention.backend import AttentionCGSupport
-from vllm.v1.kv_cache_interface import AttentionSpec
 
 from vllm_ascend.attention.mla_v1 import (
     AscendMLABackend,
@@ -75,23 +66,6 @@ SPARSE_CAUSAL_MODE = 3
 SPARSE_ATTENTION_MODE = 2
 
 
-class AscendKpoolMLAMetadataBuilder(AscendMLAMetadataBuilder):
-    """Dense MLA metadata, minus the claim that it can be captured.
-
-    Everything the sparse chain reads -- block table, sequence lengths, query
-    offsets, token positions, the shared zero rope buffers -- the dense builder
-    already produces. Only the capture support differs.
-    """
-
-    @classmethod
-    def get_cudagraph_support(
-        cls,
-        vllm_config: VllmConfig,
-        kv_cache_spec: AttentionSpec,
-    ) -> AttentionCGSupport:
-        return AttentionCGSupport.NEVER
-
-
 class AscendKpoolMLABackend(AscendMLABackend):
     @staticmethod
     def get_name() -> str:
@@ -102,8 +76,11 @@ class AscendKpoolMLABackend(AscendMLABackend):
         return AscendKpoolMLAImpl
 
     @staticmethod
-    def get_builder_cls() -> type[AscendKpoolMLAMetadataBuilder]:
-        return AscendKpoolMLAMetadataBuilder
+    def get_builder_cls() -> type[AscendMLAMetadataBuilder]:
+        # Everything the sparse chain reads -- block table, sequence lengths,
+        # query offsets, token positions, the shared zero rope buffers -- the
+        # dense builder already produces, capture support included.
+        return AscendMLAMetadataBuilder
 
 
 class AscendKpoolMLAImpl(AscendMLAImpl):
@@ -133,6 +110,25 @@ class AscendKpoolMLAImpl(AscendMLAImpl):
         # The scores are a weights-weighted sum over heads, so folding the
         # softmax scale into the weights keeps it out of the operator's call.
         self.index_weight_scale: float = indexer.softmax_scale * indexer.n_head**-0.5
+
+    @staticmethod
+    def update_graph_params(
+        update_stream,
+        forward_context,
+        num_tokens,
+        vllm_config=None,
+        speculative_config=None,
+        draft_attn_metadatas=None,
+    ):
+        """No-op: nothing in the sparse call has to be rebound before a replay.
+
+        The dense path re-issues its attention through a task-group handle
+        because ``npu_fused_infer_attention_score`` takes the key lengths as a
+        host-side Python list, and a captured graph has no way to refresh one.
+        Every operand of ``npu_sparse_flash_attention`` is a tensor, so a replay
+        picks up the new step by reading the same buffers, the way the SFA impl
+        already relies on.
+        """
 
     # ---- inputs -----------------------------------------------------------
 
@@ -278,15 +274,11 @@ class AscendKpoolMLAImpl(AscendMLAImpl):
         """Attend over the selected tokens only.
 
         ``selected_lens`` is how many entries of ``token_ids`` each row filled.
+        Both length arguments arrive on the query's device, which is what lets
+        this call be captured: every operand being a tensor means a replay reads
+        the new step out of the same buffers and nothing has to be rebound.
         """
         import torch_npu
-
-        # The MLA metadata builder keeps its sequence lengths on the host, but
-        # the operator rejects operands that do not sit with its tensors. Both
-        # are one int per request, so the copy is small and asynchronous --
-        # unlike a read in the other direction, which would stall the step.
-        cumulative_query_lens = cumulative_query_lens.to(q_nope.device)
-        selected_lens = selected_lens.to(q_nope.device)
 
         # A NoPE model has no rope operands, and the operator will not take a
         # zero width, so both halves are the shared all-zero buffer.
@@ -348,14 +340,21 @@ class AscendKpoolMLAImpl(AscendMLAImpl):
             decode = attn_metadata.decode
             num_requests = decode.seq_lens.shape[0]
             rows = num_decode_tokens // max(num_requests, 1)
+            # Both lengths have to reach the selection already on the device.
+            # Copying them in would work while eager and break under ACL-graph
+            # capture, which records the host address the copy read and replays
+            # against whatever occupies it by then. decode.seq_lens is a host
+            # tensor, but the positions are not, and a decode row's position is
+            # one short of the tokens its request knows.
+            decode_positions = decode.input_positions[:num_decode_tokens].view(num_requests, rows)
             self._decode_selection = self.select_tokens(
                 hidden_states[:num_decode_tokens],
                 decode.input_positions,
                 decode.block_table,
                 # A decode batch gives every request the same number of rows:
                 # one when plain, num_spec + 1 when verifying drafts.
-                query_lens=torch.full((num_requests,), rows, dtype=torch.int32, device=decode.seq_lens.device),
-                seq_lens=decode.seq_lens,
+                query_lens=torch.full((num_requests,), rows, dtype=torch.int32, device=decode_positions.device),
+                seq_lens=(decode_positions[:, -1] + 1).to(torch.int32),
                 max_query_len=rows,
                 is_decode=True,
             )
