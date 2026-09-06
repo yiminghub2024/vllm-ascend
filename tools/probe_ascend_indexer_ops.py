@@ -219,6 +219,117 @@ def probe_lightning_indexer(num_heads: int) -> None:
     print(f"        valid-before-invalid padding: {monotone}")
 
 
+def probe_prefill_masking(num_heads: int = 16) -> None:
+    """Ask how a prefill chunk can select over a pool-granular cache.
+
+    ``sparse_mode=3`` masks one *key* per query row, and with pooled keys a key
+    is ``index_kpool`` tokens, so the causal boundary advances four times too
+    fast for a prefill chunk. Decode is unaffected (one query row per request),
+    but prefill needs one of the escapes below.
+
+    Each variant prints whether the operator accepts it and whether the result
+    matches the reference for that masking rule. A variant that is accepted and
+    matches is enough to make prefill selection exact.
+    """
+    banner("npu_lightning_indexer  (prefill masking escapes)")
+    torch.manual_seed(0)
+
+    query_lens = [4, 12]
+    pool_lens = [70, 40]
+    num_tokens = sum(query_lens)
+    sparse_count = 32
+
+    blocks_per_request = (max(pool_lens) + POOL_BLOCK_SIZE - 1) // POOL_BLOCK_SIZE
+    num_pages = len(query_lens) * blocks_per_request
+
+    query = torch.randn(num_tokens, num_heads, HEAD_DIM, dtype=torch.bfloat16)
+    key_pages = torch.randn(num_pages, POOL_BLOCK_SIZE, 1, HEAD_DIM, dtype=torch.bfloat16)
+    weights = torch.randn(num_tokens, num_heads, dtype=torch.bfloat16)
+    cumulative_query = torch.tensor(query_lens, dtype=torch.int32).cumsum(0).to(torch.int32)
+    seq_lens_key = torch.tensor(pool_lens, dtype=torch.int32)
+    block_table = torch.arange(num_pages, dtype=torch.int32).reshape(len(query_lens), blocks_per_request)
+
+    def scores_for(request: int, start: int, query_len: int) -> torch.Tensor:
+        key_len = int(seq_lens_key[request])
+        blocks = (key_len + POOL_BLOCK_SIZE - 1) // POOL_BLOCK_SIZE
+        gathered = torch.zeros((blocks * POOL_BLOCK_SIZE, HEAD_DIM), dtype=key_pages.dtype)
+        for block in range(blocks):
+            page = key_pages[int(block_table[request, block])]
+            gathered[block * POOL_BLOCK_SIZE : (block + 1) * POOL_BLOCK_SIZE] = page.reshape(POOL_BLOCK_SIZE, HEAD_DIM)
+        keys = gathered[:key_len].t().float()
+        rows = query[start : start + query_len].transpose(0, 1).float()
+        row_weights = weights[start : start + query_len].transpose(0, 1).unsqueeze(-1).float()
+        return (torch.relu(torch.matmul(rows, keys)) * row_weights).sum(dim=0)
+
+    def reference(per_query_key_lens: torch.Tensor | None) -> torch.Tensor:
+        """Top-k with no mask, or with one key length per query row."""
+        out = torch.full((num_tokens, 1, sparse_count), -1, dtype=torch.int32)
+        start = 0
+        for request, query_len in enumerate(query_lens):
+            scores = scores_for(request, start, query_len)
+            visible = torch.full((query_len,), int(seq_lens_key[request]), dtype=torch.int64)
+            if per_query_key_lens is not None:
+                visible = per_query_key_lens[start : start + query_len].to(torch.int64)
+            for row in range(query_len):
+                scores[row, int(visible[row]) :] = float("-inf")
+            order = torch.argsort(scores, dim=1, descending=True, stable=True)
+            for row in range(query_len):
+                keep = min(sparse_count, int(visible[row]))
+                out[start + row, 0, :keep] = order[row, :keep].to(torch.int32)
+            start += query_len
+        return out
+
+    def call(**overrides) -> torch.Tensor:
+        kwargs = dict(
+            actual_seq_lengths_query=cumulative_query.npu(),
+            actual_seq_lengths_key=seq_lens_key.npu(),
+            block_table=block_table.npu(),
+            layout_query="TND",
+            layout_key="PA_BSND",
+            sparse_count=sparse_count,
+            sparse_mode=3,
+        )
+        kwargs.update({k: (v.npu() if isinstance(v, torch.Tensor) else v) for k, v in overrides.items()})
+        indices, _ = torch_npu.npu_lightning_indexer(query.npu(), key_pages.npu(), weights.npu(), **kwargs)
+        return indices.cpu().reshape(num_tokens, 1, -1)
+
+    def check(actual: torch.Tensor, expected: torch.Tensor) -> None:
+        # bf16 scores tie, so compare the selected sets rather than the order.
+        mismatched = [
+            row
+            for row in range(num_tokens)
+            if {int(v) for v in actual[row, 0] if v >= 0} != {int(v) for v in expected[row, 0] if v >= 0}
+        ]
+        if mismatched:
+            print(f"        MISMATCH on {len(mismatched)}/{num_tokens} rows: {mismatched[:6]}")
+        else:
+            print(f"        matches the reference on all {num_tokens} rows  <-- usable")
+
+    # 1. No mask at all: enough for "sparse over the pool prefix, dense over the
+    #    chunk", which is exact because the chunk is attended to densely anyway.
+    unmasked = report("sparse_mode=0 (no mask)", lambda: call(sparse_mode=0))
+    if unmasked is not None:
+        check(unmasked, reference(None))
+
+    # 2. One key length per query row rather than per request. If the operator
+    #    reads it that way, prefill selection is exact with no decomposition.
+    per_query = torch.cat(
+        [
+            (int(seq_lens_key[request]) - query_len + 1 + torch.arange(query_len)).to(torch.int32)
+            for request, query_len in enumerate(query_lens)
+        ]
+    )
+    got = report("actual_seq_lengths_key per query row", lambda: call(actual_seq_lengths_key=per_query))
+    if got is not None:
+        check(got, reference(per_query))
+
+    # 3. A band, which would let the mask slope be set explicitly.
+    report(
+        "sparse_mode=3 + pre_tokens/next_tokens",
+        lambda: call(pre_tokens=(1 << 63) - 1, next_tokens=(1 << 63) - 1),
+    )
+
+
 def sparse_attention_variant(
     *,
     num_heads: int = 16,
@@ -335,9 +446,13 @@ def probe_sparse_attention() -> None:
 def main() -> None:
     env_report()
     # Already confirmed on Ascend950PR: bf16 pool-granular keys score correctly
-    # at index_n_heads=16, so keep one run as a regression check only.
+    # at index_n_heads=16, and the sparse attention takes pool ids expanded to
+    # token ids with a zero rope half. Keep both as regression checks only.
     probe_lightning_indexer(16)
     probe_sparse_attention()
+    # The open question: prefill needs a mask whose slope is not one key per
+    # query row. Decode does not care and is already exact.
+    probe_prefill_masking()
     print("\nDone. Paste the whole output back.")
 
 
