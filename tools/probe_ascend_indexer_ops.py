@@ -224,7 +224,10 @@ def sparse_attention_variant(
     num_heads: int = 16,
     nope_dim: int = 512,
     rope_dim: int = 64,
+    zero_rope: bool = False,
+    alias_zero_rope_cache: bool = False,
     sparse_block_size: int = 1,
+    sparse_size: int | None = None,
     attention_mode: int = 2,
     layout_query: str = "TND",
     cumulative_query_lens: bool = True,
@@ -239,11 +242,13 @@ def sparse_attention_variant(
     """
     torch.manual_seed(0)
     kv_block_size = 64  # model-wide cache block_size, token-granular
-    seq_len = 200
     query_lens = [1, 1]
     num_tokens = sum(query_lens)
     # sparse_size counts blocks of `sparse_block_size` tokens each.
-    sparse_size = 64 // sparse_block_size
+    if sparse_size is None:
+        sparse_size = 64 // sparse_block_size
+    # Long enough that every sparse index addresses a real token.
+    seq_len = max(200, sparse_size * sparse_block_size + 8)
 
     blocks = (seq_len + kv_block_size - 1) // kv_block_size
     query = torch.randn(num_tokens, num_heads, nope_dim, dtype=torch.bfloat16).npu()
@@ -282,8 +287,18 @@ def sparse_attention_variant(
         )
     else:
         if rope_dim:
-            shared["query_rope"] = torch.randn(num_tokens, num_heads, rope_dim, dtype=torch.bfloat16).npu()
-            shared["key_rope"] = torch.randn(blocks, kv_block_size, 1, rope_dim, dtype=torch.bfloat16).npu()
+            # A NoPE model has no rope half, but the op requires one. Zeros
+            # contribute exactly nothing to the QK dot product, so padding with
+            # them leaves the attention output unchanged.
+            build = torch.zeros if zero_rope else torch.randn
+            shared["query_rope"] = build(num_tokens, num_heads, rope_dim, dtype=torch.bfloat16).npu()
+            if alias_zero_rope_cache:
+                # Every block aliasing one zero page would make the padding
+                # cost O(1) memory instead of 128 bytes per token.
+                page = torch.zeros(kv_block_size, 1, rope_dim, dtype=torch.bfloat16).npu()
+                shared["key_rope"] = page.as_strided((blocks, kv_block_size, 1, rope_dim), (0, rope_dim, rope_dim, 1))
+            else:
+                shared["key_rope"] = build(blocks, kv_block_size, 1, rope_dim, dtype=torch.bfloat16).npu()
         out = torch_npu.npu_sparse_flash_attention(query, kv_pages, kv_pages, **shared)
 
     out = out[0] if isinstance(out, tuple) else out
@@ -296,18 +311,20 @@ def probe_sparse_attention() -> None:
     # interpretable and the call shape itself is what needs fixing.
     variants: list[tuple[str, dict]] = [
         ("baseline: heads=16 rope=64 sbs=1 mode=2", {}),
-        ("query lens NOT cumulative", {"cumulative_query_lens": False}),
-        ("attention_mode=0", {"attention_mode": 0}),
-        ("heads=128", {"num_heads": 128}),
-        ("layout_query=BSND", {"layout_query": "BSND"}),
-        # The two questions that decide the GLM design.
-        (f"sparse_block_size={INDEX_KPOOL}  <-- pool ids direct", {"sparse_block_size": INDEX_KPOOL}),
-        ("rope_dim=0  <-- GLM is NoPE MLA", {"rope_dim": 0}),
+        # Round 2 settled these: mode must be 2, sparse_block_size must be 1,
+        # and the rope half is mandatory. What is left is how GLM pays for the
+        # rope half it does not have, and how wide the index list may be.
+        ("zero rope half  <-- NoPE workaround", {"zero_rope": True}),
         (
-            f"rope_dim=0 + sparse_block_size={INDEX_KPOOL}  <-- what GLM wants",
-            {"rope_dim": 0, "sparse_block_size": INDEX_KPOOL},
+            "zero rope half, one aliased zero page  <-- O(1) memory",
+            {"zero_rope": True, "alias_zero_rope_cache": True},
         ),
-        (f"kv_quant op, sparse_block_size={INDEX_KPOOL}", {"kv_quant": True, "sparse_block_size": INDEX_KPOOL}),
+        ("heads=8 (num_attention_heads=64 at TP8)", {"num_heads": 8, "zero_rope": True}),
+        # index_topk=2048 and index_kpool=4, so expanding the 512 selected
+        # pools plus the tail needs 2048 + 3 indices. 2048 is where the
+        # indexer's own sparse_count caps out, so check the FA separately.
+        ("sparse_size=2048", {"sparse_size": 2048, "zero_rope": True}),
+        ("sparse_size=2051  <-- index_topk + kpool - 1", {"sparse_size": 2051, "zero_rope": True}),
     ]
     for name, overrides in variants:
         result = report(name, lambda o=overrides: sparse_attention_variant(**o))
