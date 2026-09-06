@@ -82,7 +82,7 @@ def fwht128_quant_fp8(q: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     return q_fp8, scale
 
 
-def _softmax_pool_slots(
+def compress_pool(
     slot_k: torch.Tensor,
     slot_score: torch.Tensor,
     ape: torch.Tensor,
@@ -97,16 +97,23 @@ def _softmax_pool_slots(
     slot's weight depends on where it sits inside the pool as well as on its
     gate score.
 
-    Returns a bfloat16 ``[n_pools, head_dim]`` tensor: the fused kernel rounds
-    to bfloat16 here before rotating, and the FP8 operand only matches across
-    backends if that rounding happens on both.
+    Args:
+        slot_k: ``[..., pool_size, head_dim]`` -- raw per-token indexer K.
+        slot_score: ``[..., pool_size, head_dim]`` -- per-token gate score.
+        ape: ``[pool_size, head_dim]`` -- per-slot position bias.
+
+    Returns:
+        ``[..., head_dim]`` in ``slot_k``'s dtype.
     """
+    assert slot_score.shape == slot_k.shape, (slot_score.shape, slot_k.shape)
+    assert ape.shape == slot_k.shape[-2:], (ape.shape, slot_k.shape)
+
     score = slot_score.float() + ape.float()
     # Subtracting the per-dimension max keeps the exponent finite; it cancels
     # against the denominator, so the weights themselves are unchanged.
-    prob = torch.exp(score - score.amax(dim=1, keepdim=True))
-    pooled = (slot_k.float() * prob).sum(dim=1) / prob.sum(dim=1)
-    return pooled.to(torch.bfloat16)
+    prob = torch.exp(score - score.amax(dim=-2, keepdim=True))
+    pooled = (slot_k.float() * prob).sum(dim=-2) / prob.sum(dim=-2)
+    return pooled.to(slot_k.dtype)
 
 
 def kpool_compress_k(
@@ -126,10 +133,10 @@ def kpool_compress_k(
         ready to be written to the pool-granular index-K cache.
     """
     assert slot_k.ndim == 3, slot_k.shape
-    assert slot_score.shape == slot_k.shape, (slot_score.shape, slot_k.shape)
-    assert ape.shape == slot_k.shape[1:], (ape.shape, slot_k.shape)
 
-    return fwht128_quant_fp8(_softmax_pool_slots(slot_k, slot_score, ape))
+    # The fused kernel rounds to bfloat16 here before rotating, and the FP8
+    # operand only matches across backends if that rounding happens on both.
+    return fwht128_quant_fp8(compress_pool(slot_k, slot_score, ape).to(torch.bfloat16))
 
 
 def expand_pools_and_append_tail(

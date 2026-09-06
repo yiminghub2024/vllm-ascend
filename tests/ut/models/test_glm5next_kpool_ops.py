@@ -21,7 +21,7 @@ import torch
 from vllm_ascend.models.glm5next.ops.kpool_compress import (
     FP8_E4M3_MAX,
     _normalized_hadamard,
-    _softmax_pool_slots,
+    compress_pool,
     expand_pools_and_append_tail,
     fwht128_quant_fp8,
     kpool_compress_k,
@@ -86,7 +86,7 @@ def test_pooling_mixes_slots_independently_per_dimension() -> None:
     slot_score = torch.full((1, pool_size, HEAD_DIM), -30.0)
     slot_score[0, winner, torch.arange(HEAD_DIM)] = 30.0
 
-    pooled = _softmax_pool_slots(slot_k, slot_score.to(torch.bfloat16), torch.zeros(pool_size, HEAD_DIM))
+    pooled = compress_pool(slot_k, slot_score.to(torch.bfloat16), torch.zeros(pool_size, HEAD_DIM))
 
     expected = slot_k[0, winner, torch.arange(HEAD_DIM)]
     torch.testing.assert_close(pooled[0].float(), expected.float(), rtol=1e-2, atol=1e-2)
@@ -100,7 +100,7 @@ def test_position_bias_can_override_the_gate_score() -> None:
     ape = torch.full((pool_size, HEAD_DIM), -60.0)
     ape[2] = 60.0
 
-    pooled = _softmax_pool_slots(slot_k, slot_score, ape)
+    pooled = compress_pool(slot_k, slot_score, ape)
 
     torch.testing.assert_close(pooled.float(), slot_k[:, 2].float(), rtol=1e-2, atol=1e-2)
 
@@ -110,7 +110,7 @@ def test_pooling_is_a_weighted_average_of_the_pooled_tokens(pool_size: int) -> N
     """Softmax weights sum to one, so no dimension can leave the input range."""
     slot_k, slot_score, ape = _pool_inputs(n_pools=5, pool_size=pool_size)
 
-    pooled = _softmax_pool_slots(slot_k, slot_score, ape).float()
+    pooled = compress_pool(slot_k, slot_score, ape).float()
 
     lower = slot_k.float().amin(dim=1)
     upper = slot_k.float().amax(dim=1)
@@ -146,7 +146,7 @@ def test_compression_round_trips_within_fp8_precision() -> None:
 
     k_fp8, scale = kpool_compress_k(slot_k, slot_score, ape)
 
-    pooled = _softmax_pool_slots(slot_k, slot_score, ape)
+    pooled = compress_pool(slot_k, slot_score, ape)
     rotated = (pooled.float() @ _normalized_hadamard(HEAD_DIM, torch.device("cpu"), torch.float32)).to(torch.bfloat16)
     # e4m3 keeps 3 mantissa bits, so a value sits within half a step -- 2**-4
     # relative -- of a representable one once the shared scale is removed.
