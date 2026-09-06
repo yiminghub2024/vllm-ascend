@@ -11,6 +11,7 @@ import torch
 from vllm_ascend.models.glm5next.ops.kpool_indexer import (
     LIGHTNING_INDEXER_POOLS_ALIGNMENT,
     pa_bsnd_keys,
+    request_index_per_row,
     row_seq_lens,
     select_token_ids,
     tail_width_for,
@@ -140,6 +141,43 @@ def test_selected_ids_are_causal_and_cover_the_recent_run(query_lens, fake_opera
 def test_row_sequence_lengths_count_back_from_the_step():
     per_row = row_seq_lens(torch.tensor([21, 33]), torch.tensor([1, 4]))
     torch.testing.assert_close(per_row, torch.tensor([21, 30, 31, 32, 33]))
+
+
+@pytest.mark.parametrize("query_lens", [[1, 1, 1], [4], [1, 4], [3, 2, 5], [2, 0, 3]])
+def test_request_index_per_row_matches_the_one_argument_spelling(query_lens):
+    """The supported overload has to agree with the one it replaces."""
+    lens = torch.tensor(query_lens, dtype=torch.int32)
+    rows = request_index_per_row(lens, sum(query_lens))
+    torch.testing.assert_close(rows, torch.repeat_interleave(lens.to(torch.int64)))
+    assert rows.dtype == torch.int64
+
+
+def test_kpool_ops_avoid_the_repeat_interleave_overload_without_an_npu_kernel():
+    """``repeat_interleave(repeats)`` falls back to the CPU and stalls the step.
+
+    The one-argument spelling picks ``aten::repeat_interleave.Tensor``, which
+    the NPU backend does not implement. Naming the source tensor picks the
+    two-argument overload, which it does.
+    """
+    import ast
+    from pathlib import Path
+
+    ops = Path(__file__).resolve().parents[3] / "vllm_ascend" / "models" / "glm5next" / "ops"
+    offenders = []
+    for path in sorted(ops.glob("*.py")):
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if getattr(func, "attr", None) != "repeat_interleave":
+                continue
+            # A bare integer repeat count is a different, supported overload.
+            if len(node.args) == 1 and not isinstance(node.args[0], ast.Constant):
+                offenders.append(f"{path.name}:{node.lineno}")
+    assert not offenders, (
+        "these calls select aten::repeat_interleave.Tensor, which has no NPU "
+        f"kernel; pass the source tensor as well: {offenders}"
+    )
 
 
 def test_pa_bsnd_keeps_the_pool_axis():

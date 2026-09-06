@@ -183,13 +183,29 @@ def select_token_ids(
     # The operator answers per query row, so the request-granular boundary and
     # sequence length both have to be spread out to one entry per row. The width
     # is passed in because deriving it from a device tensor is a host read.
-    rows = torch.repeat_interleave(query_lens.to(torch.int64), output_size=query.shape[0])
+    rows = request_index_per_row(query_lens, query.shape[0])
     return expand_pools_and_append_tail(
         pool_ids.reshape(query.shape[0], -1),
         row_seq_lens(seq_lens, query_lens, rows=rows),
         pool_size,
         selectable_pools=selectable[rows],
         tail_width=tail_width_for(pool_size, max_query_len),
+    )
+
+
+def request_index_per_row(query_lens: torch.Tensor, num_tokens: int) -> torch.Tensor:
+    """Which request each query row belongs to, ``[num_tokens]`` int64.
+
+    Spelling the source out is not redundant: the one-argument
+    ``repeat_interleave(repeats)`` selects the ``aten::repeat_interleave.Tensor``
+    overload, which has no NPU kernel and silently falls back to the CPU. That
+    drags the lengths off the device and stalls the step, once per layer. The
+    two-argument overload is the one the rest of this repo relies on.
+    """
+    return torch.repeat_interleave(
+        torch.arange(query_lens.shape[0], dtype=torch.int64, device=query_lens.device),
+        query_lens,
+        output_size=num_tokens,
     )
 
 
@@ -210,9 +226,11 @@ def row_seq_lens(
         query_lens: ``[num_requests]``.
         rows: ``[num_tokens]`` request index per query row, if already built.
     """
-    query_lens = query_lens.to(torch.int64)
     if rows is None:
-        rows = torch.repeat_interleave(query_lens)
+        # Only for callers that are not on the decode path: sizing the output
+        # from a device tensor is a host read.
+        rows = request_index_per_row(query_lens, int(query_lens.sum()))
+    query_lens = query_lens.to(torch.int64)
     starts = torch.cumsum(query_lens, 0) - query_lens
     within = torch.arange(rows.shape[0], device=seq_lens.device) - starts[rows]
     return (seq_lens[rows] - query_lens[rows] + 1 + within).to(seq_lens.dtype)
