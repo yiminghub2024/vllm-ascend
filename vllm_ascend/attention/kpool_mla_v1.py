@@ -45,7 +45,7 @@ from vllm_ascend.attention.mla_v1 import (
     _mla_nope_zero_rope,
 )
 from vllm_ascend.models.glm5next.ops.kpool_cache import write_decode, write_prefill
-from vllm_ascend.models.glm5next.ops.kpool_indexer import select_token_ids
+from vllm_ascend.models.glm5next.ops.kpool_indexer import rows_as_batch_entries, select_token_ids
 
 # npu_sparse_flash_attention rejects a zero rope width, so a NoPE model has to
 # pay for a rope half it does not have. Probing an Ascend 950 showed the
@@ -276,10 +276,14 @@ class AscendKpoolMLAImpl(AscendMLAImpl):
     ) -> torch.Tensor:
         """Attend over the selected tokens only.
 
-        ``selected_lens`` is how many entries of ``token_ids`` each row filled.
-        Both length arguments arrive on the query's device, which is what lets
-        this call be captured: every operand being a tensor means a replay reads
-        the new step out of the same buffers and nothing has to be rebound.
+        The batch is one entry per query row, so ``block_table`` and both length
+        arguments all carry one entry per row: ``cumulative_query_lens`` because
+        the operator sizes its batch from it, ``selected_lens`` because it states
+        how many entries of ``token_ids`` that row filled.
+
+        Both lengths arrive on the query's device, which is what lets this call
+        be captured: every operand being a tensor means a replay reads the new
+        step out of the same buffers and nothing has to be rebound.
         """
         import torch_npu
 
@@ -403,31 +407,25 @@ class AscendKpoolMLAImpl(AscendMLAImpl):
         )
         token_ids, selected_lens = self._decode_selection
         num_tokens = q_nope.shape[0]
+        # One batch entry per query row, so that a draft-verify step's rows can
+        # each state how much of their own index list the operator should read.
+        per_row_block_table, query_lens = rows_as_batch_entries(
+            decode.block_table, num_tokens, decode.seq_lens.shape[0]
+        )
         attn_output = self._sparse_attention(
             q_nope.view(num_tokens, self.num_heads, -1),
             k_nope,
             token_ids,
-            decode.block_table,
-            # Built on the query's device: decode.seq_lens is a host tensor, so
-            # taking its device would put the query lengths on the CPU.
-            _cumulative(decode.seq_lens.shape[0], num_tokens, q_nope.device),
+            per_row_block_table,
+            query_lens,
             # How many ids each row actually selected, not how many tokens the
             # request knows: the operator reads that many entries of the index
             # list. A probe on an Ascend 950 showed the sequence length instead
             # both stops short of the tail and pulls in unfilled budget slots.
-            # One entry per query row, which a plain decode step makes one per
-            # request too. A draft-verify step does not, and whether the
-            # operator wants a row or a request there is still unprobed.
             selected_lens,
             decode.nope_zero_rope_cache,
         )
         return self._v_up_proj(attn_output)
-
-
-def _cumulative(num_requests: int, num_tokens: int, device) -> torch.Tensor:
-    """TND wants query lengths cumulated; a decode batch's are uniform."""
-    rows = num_tokens // max(num_requests, 1)
-    return (torch.arange(num_requests, dtype=torch.int32, device=device) + 1) * rows
 
 
 def _single_tensor(cache, name: str) -> torch.Tensor:

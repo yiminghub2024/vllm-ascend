@@ -257,6 +257,43 @@ def compact_selection(token_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tens
     return ordered.to(torch.int32), counts
 
 
+def rows_as_batch_entries(
+    block_table: torch.Tensor, num_tokens: int, num_requests: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Give every query row its own entry of the attention operator's batch.
+
+    Returns the block table restated per row and the cumulative query lengths
+    that size the batch, to be passed alongside `compact_selection`'s per-row
+    counts.
+
+    The operator takes one key length per batch entry, and a draft-verify step
+    gives a request several rows whose selections differ in length, an earlier
+    row having less history to choose from. One entry per row is what lets each
+    row state its own length. Padding a request's rows to a common one is no
+    alternative, because the operator reads a prefix of the index list and no id
+    costs nothing: repeating a selected token just weighs it twice in the
+    softmax. A plain decode step, one row per request, is the case where the two
+    readings coincide -- which is why passing the per-row counts worked until
+    drafts made a request span several rows.
+
+    Nothing is lost by splitting a request up. A row may only see its own
+    history, and the selection already enforced that when it built the row's
+    list, so the causal crop across a request's rows has nothing left to do;
+    with a single row per entry it spans nothing.
+
+    Both results are built on ``block_table``'s device. The decode metadata's
+    sequence lengths are a host tensor, and deriving these from those would
+    strand them on the CPU, where an ACL-graph capture records the host address
+    and every later replay reads whatever occupies it by then.
+    """
+    # A decode batch gives every request the same number of rows, which is what
+    # lets a row name its request by division rather than a length scan.
+    rows_per_request = max(num_tokens // max(num_requests, 1), 1)
+    rows = torch.arange(num_tokens, device=block_table.device)
+    # TND cumulates the query lengths, and one row each cumulates to 1, 2, 3...
+    return block_table[rows // rows_per_request], (rows + 1).to(torch.int32)
+
+
 def request_index_per_row(query_lens: torch.Tensor, num_tokens: int) -> torch.Tensor:
     """Which request each query row belongs to, ``[num_tokens]`` int64.
 

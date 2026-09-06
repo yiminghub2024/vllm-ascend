@@ -15,6 +15,7 @@ from vllm_ascend.models.glm5next.ops.kpool_indexer import (
     pa_bsnd_keys,
     request_index_per_row,
     row_seq_lens,
+    rows_as_batch_entries,
     select_token_ids,
     tail_width_for,
 )
@@ -327,3 +328,79 @@ def test_indexer_cache_is_constructed_at_the_logical_head_dim():
         "widening it by the FP8 scale bytes made npu_lightning_indexer see "
         "165 pools on a 160-pool page."
     )
+
+
+NUM_BLOCKS = 5
+
+
+@pytest.fixture
+def block_table():
+    return torch.arange(16 * NUM_BLOCKS, dtype=torch.int32).reshape(16, NUM_BLOCKS)
+
+
+def test_a_verify_step_gets_one_batch_entry_per_row(block_table):
+    """Drafts give a request several rows, and each states its own key length.
+
+    The operator sizes its batch from the query lengths and then demands one key
+    length per entry, so counting requests there while `compact_selection`
+    counts rows is what raised
+
+        the shape size of actualSeqLengths should be equal to batch size 16
+    """
+    rows_per_request, num_requests = 8, 16
+    num_tokens = rows_per_request * num_requests
+
+    per_row, query_lens = rows_as_batch_entries(block_table, num_tokens, num_requests)
+
+    assert query_lens.shape == (num_tokens,)
+    assert per_row.shape == (num_tokens, NUM_BLOCKS)
+    # Which is what lets compact_selection's per-row counts be passed as they are.
+    assert query_lens.shape == compact_selection(torch.zeros(num_tokens, 4, dtype=torch.int32))[1].shape
+
+
+def test_every_row_reads_its_own_request_blocks(block_table):
+    rows_per_request = 8
+    per_row, _ = rows_as_batch_entries(block_table, rows_per_request * 16, 16)
+
+    for row in range(rows_per_request * 16):
+        assert torch.equal(per_row[row], block_table[row // rows_per_request]), (
+            f"row {row} was pointed at another request's pages"
+        )
+
+
+def test_one_query_row_per_entry_so_the_causal_crop_spans_nothing(block_table):
+    """Cumulated one row at a time, every entry's query length is 1.
+
+    The rows of a request may not see each other's tokens, which the selection
+    already enforced per row; an entry holding a single row leaves the
+    operator's RightDownCausal crop nothing to cover.
+    """
+    _, query_lens = rows_as_batch_entries(block_table, 8 * 16, 16)
+
+    assert query_lens[0] == 1
+    assert torch.equal(query_lens.diff(), torch.ones(8 * 16 - 1, dtype=query_lens.dtype))
+
+
+def test_a_plain_decode_batch_is_left_as_it_was(block_table):
+    """One row per request is the case where rows and requests coincide."""
+    per_row, query_lens = rows_as_batch_entries(block_table, 16, 16)
+
+    assert torch.equal(per_row, block_table)
+    assert torch.equal(query_lens, torch.arange(1, 17, dtype=torch.int32))
+
+
+def test_an_empty_decode_batch_does_not_divide_by_zero(block_table):
+    """A prefill-only step reports no decode rows and no decode requests."""
+    per_row, query_lens = rows_as_batch_entries(block_table, 0, 0)
+
+    assert per_row.shape == (0, NUM_BLOCKS)
+    assert query_lens.shape == (0,)
+
+
+def test_the_batch_is_described_without_leaving_the_device(block_table):
+    """A host-built length is recorded by a capture and read stale on replay."""
+    per_row, query_lens = rows_as_batch_entries(block_table, 8 * 16, 16)
+
+    assert per_row.device == block_table.device
+    assert query_lens.device == block_table.device
+    assert query_lens.dtype == torch.int32
