@@ -44,8 +44,8 @@ LIGHTNING_INDEXER_MAX_POOLS = 1024
 SPARSE_INDEX_PAD = 2**31 - 1
 
 
-def pa_bsnd_keys(index_cache: torch.Tensor, head_dim: int) -> torch.Tensor:
-    """View the pooled key cache as ``[blocks, pools, 1, head_dim]``.
+def pa_bsnd_keys(index_cache: torch.Tensor, head_dim: int, pools_per_block: int) -> tuple[torch.Tensor, int]:
+    """View the pooled key cache as ``[blocks, pools_per_block, 1, head_dim]``.
 
     ``DeepseekV32IndexerCache.bind_kv_cache`` squeezes a size-1 head axis at
     dim 1, so the tensor may arrive as ``[blocks, pools, C]`` or as
@@ -53,6 +53,9 @@ def pa_bsnd_keys(index_cache: torch.Tensor, head_dim: int) -> torch.Tensor:
     1, head_dim)`` is unsafe: a 132-wide FP8-plus-scale page (160 cells)
     viewed as 128-wide bf16 becomes 165 pools, which the operator then
     rejects as ``block_size must be a multiple of 16``.
+
+    Returns the view and how many of its pages one scheduler block spans, which
+    the caller multiplies into the block table.
     """
     if index_cache.ndim == 3:
         index_cache = index_cache.unsqueeze(2)
@@ -61,9 +64,9 @@ def pa_bsnd_keys(index_cache: torch.Tensor, head_dim: int) -> torch.Tensor:
 
     _, dim1, dim2, content = index_cache.shape
     if dim2 == 1:
-        pools = dim1
+        page_pools = dim1
     elif dim1 == 1:
-        pools = dim2
+        page_pools = dim2
         index_cache = index_cache.permute(0, 2, 1, 3).contiguous()
     else:
         raise RuntimeError(f"kpool indexer key cache needs a size-1 head axis, got {tuple(index_cache.shape)}")
@@ -76,13 +79,31 @@ def pa_bsnd_keys(index_cache: torch.Tensor, head_dim: int) -> torch.Tensor:
             f"{inferred_pools} pools (165 for a 160-pool FP8-plus-scale page) "
             "and npu_lightning_indexer would reject the shape."
         )
-    if pools % LIGHTNING_INDEXER_POOLS_ALIGNMENT != 0 or not (0 < pools <= LIGHTNING_INDEXER_MAX_POOLS):
+
+    # Unifying page sizes across the cache groups pads this page out to the far
+    # wider MLA one, leaving a block's pools in its first ``pools_per_block``
+    # slots and padding behind them. The operator caps a page at 1024 pools and
+    # would reject the padded width, but splitting the page into that many
+    # sub-pages is a plain reshape over the same bytes, and a block table scaled
+    # by the split still lands each block on its own pools.
+    if page_pools % pools_per_block:
+        raise RuntimeError(
+            f"kpool indexer page holds {page_pools} pools, which is not a whole "
+            f"number of the {pools_per_block} one scheduler block addresses."
+        )
+    block_stride = page_pools // pools_per_block
+    if block_stride > 1:
+        index_cache = index_cache.reshape(-1, pools_per_block, 1, head_dim)
+
+    if pools_per_block % LIGHTNING_INDEXER_POOLS_ALIGNMENT != 0 or not (
+        0 < pools_per_block <= LIGHTNING_INDEXER_MAX_POOLS
+    ):
         raise RuntimeError(
             "npu_lightning_indexer requires the key block_size (pools per page) "
             f"to be a multiple of {LIGHTNING_INDEXER_POOLS_ALIGNMENT} in "
-            f"(0, {LIGHTNING_INDEXER_MAX_POOLS}], got {pools}."
+            f"(0, {LIGHTNING_INDEXER_MAX_POOLS}], got {pools_per_block}."
         )
-    return index_cache
+    return index_cache, block_stride
 
 
 def score_and_select_pools(
@@ -143,6 +164,7 @@ def select_token_ids(
     query_lens: torch.Tensor,
     seq_lens: torch.Tensor,
     pool_size: int,
+    pools_per_block: int,
     topk_tokens: int,
     max_query_len: int,
 ) -> torch.Tensor:
@@ -160,6 +182,10 @@ def select_token_ids(
         seq_lens: ``[num_requests]`` -- tokens known after this step, likewise
             on ``query``'s device.
         pool_size: the checkpoint's ``index_kpool``.
+        pools_per_block: pools one scheduler block addresses, from the cache
+            layer. Not inferred from the allocation: page-size unification pads
+            this cache out to the MLA page, and the padded width would name a
+            page far wider than the operator accepts.
         topk_tokens: the checkpoint's ``index_topk``.
         max_query_len: the batch's widest request, taken from the attention
             metadata rather than from ``query_lens`` -- reading a device tensor
@@ -172,7 +198,9 @@ def select_token_ids(
     """
     assert topk_tokens % pool_size == 0, (topk_tokens, pool_size)
 
-    index_cache = pa_bsnd_keys(index_cache, query.shape[-1])
+    index_cache, block_stride = pa_bsnd_keys(index_cache, query.shape[-1], pools_per_block)
+    if block_stride > 1:
+        block_table = block_table * block_stride
 
     # Copying a length in would work while eager and go silently wrong once
     # captured, so refuse it at the boundary instead of reading a stale replay.

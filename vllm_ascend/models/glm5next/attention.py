@@ -122,6 +122,11 @@ class Glm5NextIndexerCache(DeepseekV32IndexerCache):
             f"({index_kpool}) so chunked-prefill boundaries stay pool-aligned."
         )
         self._index_kpool = index_kpool
+        # What one scheduler block holds. The allocated page can be wider --
+        # unifying page sizes across cache groups pads this one out to the far
+        # larger MLA page -- so the read path needs the logical count rather
+        # than whatever the allocation's width happens to imply.
+        self.pools_per_block = cache_config.block_size // index_kpool
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig):
         from dataclasses import replace

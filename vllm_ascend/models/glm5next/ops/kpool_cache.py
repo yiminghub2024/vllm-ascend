@@ -43,6 +43,25 @@ def _scatter_pools(index_cache: torch.Tensor, pooled: torch.Tensor, pool_slots: 
     entries.index_copy_(0, destinations, pooled.reshape(-1, head_dim).to(entries.dtype))
 
 
+def _tail_ring(tail_cache: torch.Tensor, pool_size: int, head_dim: int) -> torch.Tensor:
+    """View the tail cache as ``[blocks, 2, pool_size, head_dim]``.
+
+    The slot mapping counts blocks the way the allocation does, so a page wider
+    than one ring block would make this view invent blocks the mapping never
+    names and every write would land in the wrong one. Page-size unification
+    pads the sibling indexer cache out to the MLA page; check rather than
+    assume that it left this one alone.
+    """
+    ring = tail_cache.view(-1, 2, pool_size, head_dim)
+    if ring.shape[0] != tail_cache.shape[0]:
+        raise RuntimeError(
+            f"kpool tail cache {tuple(tail_cache.shape)} holds {ring.shape[0]} "
+            f"ring blocks across {tail_cache.shape[0]} pages, so its page is "
+            "padded past one block and the tail slot mapping no longer indexes it."
+        )
+    return ring
+
+
 def _stash_tail(
     tail_cache: torch.Tensor,
     keys: torch.Tensor,
@@ -57,7 +76,7 @@ def _stash_tail(
     two heads.
     """
     head_dim = keys.shape[-1]
-    ring = tail_cache.view(-1, 2, pool_size, head_dim)
+    ring = _tail_ring(tail_cache, pool_size, head_dim)
     slots = tail_slots.reshape(-1).clamp_min(0).to(torch.int64)
     blocks = slots // pool_size
     offsets = slots % pool_size
@@ -175,7 +194,7 @@ def write_decode(
     if num_requests == 0 or tokens_per_request == 0:
         return
 
-    ring = tail_cache.view(-1, 2, pool_size, head_dim)
+    ring = _tail_ring(tail_cache, pool_size, head_dim)
     slot_offsets = torch.arange(pool_size, device=keys.device)
     # Every request's tokens are consecutive positions, so a pool member's
     # index within this call is its distance from the request's first token.

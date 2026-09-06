@@ -98,6 +98,7 @@ def _run(query_lens: list[int], seq_lens: list[int], fake_operator) -> tuple[tor
         query_lens=torch.tensor(query_lens, dtype=torch.int32),
         seq_lens=torch.tensor(seq_lens, dtype=torch.int32),
         pool_size=POOL_SIZE,
+        pools_per_block=POOLS_PER_BLOCK,
         topk_tokens=TOPK_TOKENS,
         max_query_len=max(query_lens),
     )
@@ -259,12 +260,35 @@ def test_the_selection_chain_never_copies_a_length_onto_the_device():
 
 def test_pa_bsnd_keeps_the_pool_axis():
     keys = torch.zeros(2, 160, 1, HEAD_DIM, dtype=torch.bfloat16)
-    viewed = pa_bsnd_keys(keys, HEAD_DIM)
+    viewed, stride = pa_bsnd_keys(keys, HEAD_DIM, 160)
     assert viewed.shape == (2, 160, 1, HEAD_DIM)
+    assert stride == 1
 
     squeezed = keys.squeeze(2)
     assert squeezed.shape == (2, 160, HEAD_DIM)
-    assert pa_bsnd_keys(squeezed, HEAD_DIM).shape == (2, 160, 1, HEAD_DIM)
+    assert pa_bsnd_keys(squeezed, HEAD_DIM, 160)[0].shape == (2, 160, 1, HEAD_DIM)
+
+
+def test_a_page_padded_to_the_mla_width_splits_into_addressable_blocks():
+    """Unifying page sizes pads this cache; the operator caps a page at 1024.
+
+    A block's pools sit at the front of the padded page, so splitting the page
+    into block-sized ones and striding the block table names the same bytes
+    through a page the operator accepts.
+    """
+    padded = torch.zeros(2, 2560, 1, HEAD_DIM, dtype=torch.bfloat16)
+    viewed, stride = pa_bsnd_keys(padded, HEAD_DIM, 160)
+    assert viewed.shape == (32, 160, 1, HEAD_DIM)
+    assert stride == 16
+
+    # Block 1 still starts where the second padded page does.
+    assert viewed[1 * stride].data_ptr() == padded[1].data_ptr()
+
+
+def test_pa_bsnd_rejects_a_page_that_is_not_whole_blocks():
+    ragged = torch.zeros(2, 165, 1, HEAD_DIM, dtype=torch.bfloat16)
+    with pytest.raises(RuntimeError, match="not a whole number of the 160"):
+        pa_bsnd_keys(ragged, HEAD_DIM, 160)
 
 
 def test_pa_bsnd_does_not_invent_pools_from_an_fp8_wide_page():
@@ -274,13 +298,7 @@ def test_pa_bsnd_does_not_invent_pools_from_an_fp8_wide_page():
     assert 165 % LIGHTNING_INDEXER_POOLS_ALIGNMENT != 0
 
     with pytest.raises(RuntimeError, match="content width is 132"):
-        pa_bsnd_keys(packed, HEAD_DIM)
-
-    # The shape that actually reached npu_lightning_indexer before this guard.
-    invented = packed.view(packed.shape[0], -1, 1, HEAD_DIM)
-    assert invented.shape == (2, 165, 1, HEAD_DIM)
-    with pytest.raises(RuntimeError, match="got 165"):
-        pa_bsnd_keys(invented, HEAD_DIM)
+        pa_bsnd_keys(packed, HEAD_DIM, 160)
 
 
 def test_indexer_cache_is_constructed_at_the_logical_head_dim():

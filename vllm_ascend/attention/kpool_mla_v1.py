@@ -255,6 +255,7 @@ class AscendKpoolMLAImpl(AscendMLAImpl):
             query_lens=query_lens,
             seq_lens=seq_lens,
             pool_size=self.index_kpool,
+            pools_per_block=self.indexer.k_cache.pools_per_block,
             topk_tokens=self.topk_tokens,
             max_query_len=max_query_len,
         )
