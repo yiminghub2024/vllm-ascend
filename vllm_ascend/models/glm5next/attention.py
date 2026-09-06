@@ -149,6 +149,15 @@ class Glm5NextIndexerCache(DeepseekV32IndexerCache):
             storage_block_size=page_size * self._index_kpool,
         )
 
+    def get_attn_backend(self):
+        # Not the inherited DeepSeek V3.2 indexer backend: its builder is
+        # written around DeepGEMM's paged-MQA scheduling, which has no bearing
+        # on the Ascend operators. This group only needs its pool-granular slot
+        # mapping published.
+        from vllm_ascend.attention.indexer import AscendKpoolIndexerBackend
+
+        return AscendKpoolIndexerBackend
+
 
 class Glm5NextTailCache(DeepseekV32IndexerCache):
     """Paged circular buffer for the kpool indexer's in-progress (tail) pool.
