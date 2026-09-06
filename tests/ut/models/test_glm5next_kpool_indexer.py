@@ -10,6 +10,8 @@ import torch
 
 from vllm_ascend.models.glm5next.ops.kpool_indexer import (
     LIGHTNING_INDEXER_POOLS_ALIGNMENT,
+    SPARSE_INDEX_PAD,
+    compact_selection,
     pa_bsnd_keys,
     request_index_per_row,
     row_seq_lens,
@@ -49,7 +51,10 @@ def fake_operator(monkeypatch):
         block_table = kwargs["block_table"]
         pools_per_block = key.shape[1]
 
-        out = torch.full((num_tokens, 1, budget), -1, dtype=torch.int32)
+        # The real operator's fill for unused budget slots is not specified, so
+        # stand in for it with a pool id no request could own rather than the
+        # -1 the expansion used to rely on.
+        out = torch.full((num_tokens, 1, budget), 999_999, dtype=torch.int32)
         start = 0
         for request in range(cumulative.shape[0]):
             end = int(cumulative[request])
@@ -78,7 +83,7 @@ def _cache(num_blocks: int) -> torch.Tensor:
     return torch.randn(num_blocks, POOLS_PER_BLOCK, 1, HEAD_DIM, dtype=torch.bfloat16)
 
 
-def _run(query_lens: list[int], seq_lens: list[int], fake_operator) -> torch.Tensor:
+def _run(query_lens: list[int], seq_lens: list[int], fake_operator) -> tuple[torch.Tensor, torch.Tensor]:
     torch.manual_seed(1)
     num_tokens = sum(query_lens)
     num_requests = len(query_lens)
@@ -114,7 +119,7 @@ def test_selection_is_offered_the_prefix_every_row_may_see(fake_operator):
 def test_selected_ids_are_causal_and_cover_the_recent_run(query_lens, fake_operator):
     """Nothing may name a future token, and nothing recent may go missing."""
     seq_lens = [200 + 7 * i for i in range(len(query_lens))]
-    selected = _run(query_lens, seq_lens, fake_operator)
+    selected, lens = _run(query_lens, seq_lens, fake_operator)
 
     per_row = row_seq_lens(
         torch.tensor(seq_lens, dtype=torch.int32),
@@ -124,7 +129,7 @@ def test_selected_ids_are_causal_and_cover_the_recent_run(query_lens, fake_opera
         sum(query_lens),
         TOPK_TOKENS + tail_width_for(POOL_SIZE, max(query_lens)),
     )
-    assert torch.all(selected < per_row.unsqueeze(-1))
+    assert lens.shape == (sum(query_lens),)
 
     # Every token from the request's shared boundary onwards must be named:
     # those pools were never offered to the operator, so if the expansion does
@@ -133,14 +138,48 @@ def test_selected_ids_are_causal_and_cover_the_recent_run(query_lens, fake_opera
     for request, query_len in enumerate(query_lens):
         boundary = ((seq_lens[request] - query_len + 1) // POOL_SIZE) * POOL_SIZE
         for _ in range(query_len):
-            covered = {int(v) for v in selected[row] if v >= 0}
-            assert set(range(boundary, int(per_row[row]))) <= covered
+            # Only the prefix the operator will read counts as named.
+            named = selected[row, : int(lens[row])]
+            assert torch.all(named >= 0) and torch.all(named < int(per_row[row]))
+            assert torch.all(selected[row, int(lens[row]) :] == SPARSE_INDEX_PAD)
+            assert set(range(boundary, int(per_row[row]))) <= {int(v) for v in named}
             row += 1
 
 
 def test_row_sequence_lengths_count_back_from_the_step():
     per_row = row_seq_lens(torch.tensor([21, 33]), torch.tensor([1, 4]))
     torch.testing.assert_close(per_row, torch.tensor([21, 30, 31, 32, 33]))
+
+
+def test_compaction_closes_the_gap_between_the_history_and_the_tail():
+    """The operator reads a prefix of the list, so the tail cannot sit at the end.
+
+    A row that fills 5 of 512 budget slots has its 20 oldest tokens in columns
+    0-19 and its newest two in columns 2048-2049. Handed that layout with a key
+    length of 22 the operator stops at column 20, never reaches the tail, and so
+    cannot see the newest tokens at all.
+    """
+    budget_width = 2048
+    ids = torch.full((1, budget_width + 3), -1, dtype=torch.int32)
+    ids[0, :20] = torch.arange(20, dtype=torch.int32)
+    ids[0, budget_width : budget_width + 2] = torch.tensor([20, 21], dtype=torch.int32)
+
+    ordered, lens = compact_selection(ids)
+
+    assert int(lens[0]) == 22
+    torch.testing.assert_close(ordered[0, :22], torch.arange(22, dtype=torch.int32))
+    assert torch.all(ordered[0, 22:] == SPARSE_INDEX_PAD)
+
+
+def test_compaction_counts_each_row_on_its_own():
+    ids = torch.tensor([[7, -1, 3, -1], [-1, -1, -1, -1], [4, 3, 2, 1]], dtype=torch.int32)
+
+    ordered, lens = compact_selection(ids)
+
+    torch.testing.assert_close(lens, torch.tensor([2, 0, 4], dtype=torch.int32))
+    torch.testing.assert_close(ordered[0, :2], torch.tensor([3, 7], dtype=torch.int32))
+    assert torch.all(ordered[1] == SPARSE_INDEX_PAD)
+    torch.testing.assert_close(ordered[2], torch.tensor([1, 2, 3, 4], dtype=torch.int32))
 
 
 @pytest.mark.parametrize("query_lens", [[1, 1, 1], [4], [1, 4], [3, 2, 5], [2, 0, 3]])

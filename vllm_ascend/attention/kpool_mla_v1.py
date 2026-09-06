@@ -196,8 +196,11 @@ class AscendKpoolMLAImpl(AscendMLAImpl):
         is_decode: bool,
         token_offset: int = 0,
         score: bool = True,
-    ) -> torch.Tensor | None:
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
         """Compress this step's keys into the caches, then pick token ids.
+
+        Returns the selected ids and how many of them each row filled, which is
+        what the sparse attention needs as its key length.
 
         ``token_offset`` is where this phase's tokens start in the batch. The
         cache groups publish one slot mapping spanning the whole batch, decode
@@ -269,10 +272,13 @@ class AscendKpoolMLAImpl(AscendMLAImpl):
         token_ids: torch.Tensor,
         block_table: torch.Tensor,
         cumulative_query_lens: torch.Tensor,
-        seq_lens: torch.Tensor,
+        selected_lens: torch.Tensor,
         zero_rope_cache: dict,
     ) -> torch.Tensor:
-        """Attend over the selected tokens only."""
+        """Attend over the selected tokens only.
+
+        ``selected_lens`` is how many entries of ``token_ids`` each row filled.
+        """
         import torch_npu
 
         # The MLA metadata builder keeps its sequence lengths on the host, but
@@ -280,7 +286,7 @@ class AscendKpoolMLAImpl(AscendMLAImpl):
         # are one int per request, so the copy is small and asynchronous --
         # unlike a read in the other direction, which would stall the step.
         cumulative_query_lens = cumulative_query_lens.to(q_nope.device)
-        seq_lens = seq_lens.to(q_nope.device)
+        selected_lens = selected_lens.to(q_nope.device)
 
         # A NoPE model has no rope operands, and the operator will not take a
         # zero width, so both halves are the shared all-zero buffer.
@@ -302,7 +308,7 @@ class AscendKpoolMLAImpl(AscendMLAImpl):
             sparse_block_size=SPARSE_BLOCK_SIZE,
             block_table=block_table,
             actual_seq_lengths_query=cumulative_query_lens,
-            actual_seq_lengths_kv=seq_lens,
+            actual_seq_lengths_kv=selected_lens,
             query_rope=q_rope,
             key_rope=k_rope,
             sparse_mode=SPARSE_CAUSAL_MODE,
@@ -335,15 +341,14 @@ class AscendKpoolMLAImpl(AscendMLAImpl):
             assert output is not None, "Output tensor must be provided."
             return output.fill_(0)
 
-        self._decode_token_ids: torch.Tensor | None = None
-        self._prefill_token_ids: torch.Tensor | None = None
+        self._decode_selection: tuple[torch.Tensor, torch.Tensor] | None = None
         num_decode_tokens = attn_metadata.num_decode_tokens
 
         if attn_metadata.decode is not None:
             decode = attn_metadata.decode
             num_requests = decode.seq_lens.shape[0]
             rows = num_decode_tokens // max(num_requests, 1)
-            self._decode_token_ids = self.select_tokens(
+            self._decode_selection = self.select_tokens(
                 hidden_states[:num_decode_tokens],
                 decode.input_positions,
                 decode.block_table,
@@ -388,22 +393,30 @@ class AscendKpoolMLAImpl(AscendMLAImpl):
     ):
         decode = attn_metadata.decode
         assert decode is not None
-        assert self._decode_token_ids is not None, "The decode indexer did not run."
+        assert self._decode_selection is not None, "The decode indexer did not run."
         assert decode.nope_zero_rope_cache is not None, (
             "Sparse NoPE decode needs the zero rope buffers owned by the metadata "
             "builder, but none were created: hf_text_config.qk_rope_head_dim "
             "disagrees with this layer's qk_rope_head_dim."
         )
+        token_ids, selected_lens = self._decode_selection
         num_tokens = q_nope.shape[0]
         attn_output = self._sparse_attention(
             q_nope.view(num_tokens, self.num_heads, -1),
             k_nope,
-            self._decode_token_ids,
+            token_ids,
             decode.block_table,
             # Built on the query's device: decode.seq_lens is a host tensor, so
             # taking its device would put the query lengths on the CPU.
             _cumulative(decode.seq_lens.shape[0], num_tokens, q_nope.device),
-            decode.seq_lens,
+            # How many ids each row actually selected, not how many tokens the
+            # request knows: the operator reads that many entries of the index
+            # list. A probe on an Ascend 950 showed the sequence length instead
+            # both stops short of the tail and pulls in unfilled budget slots.
+            # One entry per query row, which a plain decode step makes one per
+            # request too. A draft-verify step does not, and whether the
+            # operator wants a row or a request there is still unprobed.
+            selected_lens,
             decode.nope_zero_rope_cache,
         )
         return self._v_up_proj(attn_output)

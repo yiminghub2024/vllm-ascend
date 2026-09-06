@@ -36,6 +36,13 @@ from vllm_ascend.models.glm5next.ops.kpool_compress import (
 LIGHTNING_INDEXER_POOLS_ALIGNMENT = 16
 LIGHTNING_INDEXER_MAX_POOLS = 1024
 
+# npu_sparse_flash_attention reads exactly the first ``actual_seq_lengths_kv``
+# entries of the index list and never looks past them, so the columns beyond a
+# row's selection can hold anything. Probing an Ascend 950 confirmed the value
+# makes no difference; keying it above every real token id is what lets the sort
+# in `compact_selection` pack the valid ids to the front.
+SPARSE_INDEX_PAD = 2**31 - 1
+
 
 def pa_bsnd_keys(index_cache: torch.Tensor, head_dim: int) -> torch.Tensor:
     """View the pooled key cache as ``[blocks, pools, 1, head_dim]``.
@@ -156,7 +163,8 @@ def select_token_ids(
 
     Returns:
         ``[num_tokens, topk_tokens + tail_width]`` int32 token ids relative to
-        each request's start, padded with -1.
+        each request's start, valid ids packed to the front, plus the
+        ``[num_tokens]`` count of valid ids per row.
     """
     assert topk_tokens % pool_size == 0, (topk_tokens, pool_size)
 
@@ -184,13 +192,36 @@ def select_token_ids(
     # sequence length both have to be spread out to one entry per row. The width
     # is passed in because deriving it from a device tensor is a host read.
     rows = request_index_per_row(query_lens, query.shape[0])
-    return expand_pools_and_append_tail(
-        pool_ids.reshape(query.shape[0], -1),
-        row_seq_lens(seq_lens, query_lens, rows=rows),
-        pool_size,
-        selectable_pools=selectable[rows],
-        tail_width=tail_width_for(pool_size, max_query_len),
+    return compact_selection(
+        expand_pools_and_append_tail(
+            pool_ids.reshape(query.shape[0], -1),
+            row_seq_lens(seq_lens, query_lens, rows=rows),
+            pool_size,
+            selectable_pools=selectable[rows],
+            tail_width=tail_width_for(pool_size, max_query_len),
+        )
     )
+
+
+def compact_selection(token_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pack each row's valid token ids to the front and count them.
+
+    The expansion leaves the valid ids scattered: the selected history occupies
+    the front of a budget-wide block and the tail sits after the whole block. A
+    row that filled 5 of 512 budget slots therefore has its 20 oldest tokens in
+    columns 0-19 and its newest two in columns 2048-2049.
+
+    That layout is unusable, because the operator reads a prefix of the list
+    rather than the whole of it: with the count it would stop at column 20 and
+    never reach the tail, which is exactly the newest tokens the model cannot do
+    without. Sorting with the invalid entries keyed above every real id closes
+    the gap and leaves the ids in ascending token order, without assuming
+    anything about where top-k put its own padding.
+    """
+    counts = (token_ids >= 0).sum(dim=-1, dtype=torch.int32)
+    keyed = torch.where(token_ids >= 0, token_ids, SPARSE_INDEX_PAD)
+    ordered, _ = keyed.sort(dim=-1)
+    return ordered.to(torch.int32), counts
 
 
 def request_index_per_row(query_lens: torch.Tensor, num_tokens: int) -> torch.Tensor:
