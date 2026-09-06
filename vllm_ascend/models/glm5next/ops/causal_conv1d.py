@@ -4,18 +4,22 @@
 
 The upstream CUDA kernels reference ``tl.extra.cuda.gdc_wait``, which Ascend
 Triton does not provide -- the AST visitor raises even when ``launch_pdl`` is
-False. Both entry points are therefore routed to Ascend implementations, and the
-kwargs the upstream signatures grew for CUDA-side cache management are dropped
-here rather than at every call site.
+False. Both entry points are therefore routed to Ascend implementations.
 
-``causal_conv1d_update`` prefers the NPU Triton kernel, which has no host sync
-and accepts the spec-decode arguments directly. The PyTorch fallback calls
-``.item()`` per request, so ACL graph capture stalls at decode-FULL when the
-kernel is unavailable; ``has_npu_triton_conv1d_update()`` lets the caller report
-that up front instead of hanging during capture.
+``npu_causal_conv1d_custom`` is the same fused operator the Qwen3-Next GDN and
+Kimi KDA layers use, so it keeps all per-request bookkeeping on device. That
+matters beyond throughput: the PyTorch fallback walks ``query_start_loc`` with
+``.item()`` per request, and a host sync is rejected outright while an ACL graph
+is being captured, which used to abort decode-FULL capture. The fallback is kept
+for builds without the custom operator, where capture is unavailable anyway.
+
+Both entry points take ``x`` token-major (``[num_tokens, dim]``), ``weight`` in
+the operator's ``[width, dim]`` kernel layout, and ``conv_state`` exactly as the
+Mamba cache allocates it; the fallback re-derives the layouts it needs.
 """
 
 import torch
+from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 
 from vllm_ascend.ops.causal_conv1d import (
     causal_conv1d_fn as _torch_causal_conv1d_fn,
@@ -24,49 +28,99 @@ from vllm_ascend.ops.causal_conv1d import (
     causal_conv1d_update as _torch_causal_conv1d_update,
 )
 
-try:
-    from vllm_ascend.ops.triton.mamba.causal_conv1d import (  # type: ignore[attr-defined]
-        causal_conv1d_update_npu as _npu_triton_conv1d_update,
+# Mode selectors understood by npu_causal_conv1d_custom.
+_ACTIVATION_SILU = 1
+_RUN_MODE_VARLEN = 0
+_RUN_MODE_UPDATE = 1
+
+
+def _has_fused_conv1d() -> bool:
+    return hasattr(torch.ops._C_ascend, "npu_causal_conv1d_custom")
+
+
+def causal_conv1d_fn(
+    x: torch.Tensor,
+    conv_state: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    *,
+    query_start_loc: torch.Tensor,
+    cache_indices: torch.Tensor,
+    initial_state_mode: torch.Tensor | None,
+) -> torch.Tensor:
+    """Run the varlen (prefill) convolution and seed ``conv_state``."""
+    if not _has_fused_conv1d():
+        return _torch_causal_conv1d_fn(
+            x.transpose(0, 1),
+            weight.transpose(0, 1),
+            bias,
+            activation="silu",
+            conv_states=conv_state,
+            has_initial_state=initial_state_mode,
+            cache_indices=cache_indices,
+            query_start_loc=query_start_loc,
+        ).transpose(0, 1)
+
+    output = torch.empty_like(x)
+    # Consume the operator's declared output alias. Returning ``output``
+    # independently would let graph functionalization treat the custom-op
+    # result as dead and expose the uninitialized allocation instead.
+    return torch.ops._C_ascend.npu_causal_conv1d_custom(
+        output,
+        x,
+        weight,
+        conv_state=conv_state,
+        bias_opt=bias,
+        query_start_loc_opt=query_start_loc,
+        cache_indices_opt=cache_indices,
+        initial_state_mode_opt=initial_state_mode,
+        num_accepted_tokens_opt=None,
+        activation_mode=_ACTIVATION_SILU,
+        pad_slot_id=PAD_SLOT_ID,
+        run_mode=_RUN_MODE_VARLEN,
     )
 
-    _HAS_NPU_TRITON_CONV1D_UPDATE = True
-except ImportError:
-    _npu_triton_conv1d_update = None
-    _HAS_NPU_TRITON_CONV1D_UPDATE = False
 
-# Cache-management and validation kwargs the upstream CUDA signatures accept but
-# the Ascend implementations neither need nor understand.
-_UNSUPPORTED_KWARGS = (
-    "null_block_id",
-    "block_idx_first_scheduled_token",
-    "block_idx_last_scheduled_token",
-    "initial_state_idx",
-    "num_computed_tokens",
-    "block_size_to_align",
-    "validate_data",
-    "metadata",
-)
+def causal_conv1d_update(
+    x: torch.Tensor,
+    conv_state: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    *,
+    query_start_loc: torch.Tensor,
+    cache_indices: torch.Tensor,
+    num_accepted_tokens: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Slide ``conv_state`` over the decode / draft-verify tokens.
 
-_UPDATE_FALLBACK_UNSUPPORTED_KWARGS = (*_UNSUPPORTED_KWARGS, "max_query_len", "out")
+    ``cache_indices`` is the recurrent state index tensor, which carries one
+    column per draft slot on the speculative path; only its first column names
+    the conv state, so the fallback narrows it.
+    """
+    if not _has_fused_conv1d():
+        return _torch_causal_conv1d_update(
+            x,
+            conv_state,
+            weight.transpose(0, 1),
+            bias,
+            activation="silu",
+            conv_state_indices=cache_indices[:, 0] if cache_indices.dim() > 1 else cache_indices,
+            num_accepted_tokens=num_accepted_tokens,
+            query_start_loc=query_start_loc,
+        )
 
-
-def has_npu_triton_conv1d_update() -> bool:
-    """Whether the host-sync-free NPU Triton update kernel is available."""
-    return _HAS_NPU_TRITON_CONV1D_UPDATE
-
-
-def causal_conv1d_fn(*args, **kwargs) -> torch.Tensor:
-    for key in _UNSUPPORTED_KWARGS:
-        kwargs.pop(key, None)
-    return _torch_causal_conv1d_fn(*args, **kwargs)
-
-
-def causal_conv1d_update(*args, **kwargs) -> torch.Tensor:
-    if _npu_triton_conv1d_update is not None:
-        for key in _UNSUPPORTED_KWARGS:
-            kwargs.pop(key, None)
-        return _npu_triton_conv1d_update(*args, **kwargs)
-
-    for key in _UPDATE_FALLBACK_UNSUPPORTED_KWARGS:
-        kwargs.pop(key, None)
-    return _torch_causal_conv1d_update(*args, **kwargs)
+    output = torch.empty_like(x)
+    return torch.ops._C_ascend.npu_causal_conv1d_custom(
+        output,
+        x,
+        weight,
+        conv_state=conv_state,
+        bias_opt=bias,
+        query_start_loc_opt=query_start_loc,
+        cache_indices_opt=cache_indices,
+        initial_state_mode_opt=None,
+        num_accepted_tokens_opt=num_accepted_tokens,
+        activation_mode=_ACTIVATION_SILU,
+        pad_slot_id=PAD_SLOT_ID,
+        run_mode=_RUN_MODE_UPDATE,
+    )
