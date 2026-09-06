@@ -275,6 +275,13 @@ class AscendKpoolMLAImpl(AscendMLAImpl):
         """Attend over the selected tokens only."""
         import torch_npu
 
+        # The MLA metadata builder keeps its sequence lengths on the host, but
+        # the operator rejects operands that do not sit with its tensors. Both
+        # are one int per request, so the copy is small and asynchronous --
+        # unlike a read in the other direction, which would stall the step.
+        cumulative_query_lens = cumulative_query_lens.to(q_nope.device)
+        seq_lens = seq_lens.to(q_nope.device)
+
         # A NoPE model has no rope operands, and the operator will not take a
         # zero width, so both halves are the shared all-zero buffer.
         q_rope = _mla_nope_zero_rope(q_nope, SPARSE_ROPE_DIM, zero_rope_cache)
@@ -393,7 +400,9 @@ class AscendKpoolMLAImpl(AscendMLAImpl):
             k_nope,
             self._decode_token_ids,
             decode.block_table,
-            _cumulative(decode.seq_lens.shape[0], num_tokens, decode.seq_lens.device),
+            # Built on the query's device: decode.seq_lens is a host tensor, so
+            # taking its device would put the query lengths on the CPU.
+            _cumulative(decode.seq_lens.shape[0], num_tokens, q_nope.device),
             decode.seq_lens,
             decode.nope_zero_rope_cache,
         )
