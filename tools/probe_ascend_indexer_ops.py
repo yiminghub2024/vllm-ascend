@@ -27,10 +27,20 @@ Run inside the container:
 
 from __future__ import annotations
 
-import torch
+import os
+import sys
+
+# Running this file directly puts ``tools/`` on sys.path, where the ``bisect``
+# package shadows the stdlib module that ``tempfile`` -- and so ``torch`` --
+# imports. Drop it before importing anything else.
+_TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
+if sys.path and os.path.abspath(sys.path[0]) == _TOOLS_DIR:
+    sys.path.pop(0)
+
+import torch  # noqa: E402
 
 try:
-    import torch_npu  # noqa: F401
+    import torch_npu  # noqa: E402, F401
 except ImportError:
     raise SystemExit("torch_npu is unavailable; run this inside the Ascend container")
 
@@ -67,14 +77,17 @@ def env_report() -> None:
         print(f"  device         {torch.npu.get_device_name(0)}")
     except Exception as exc:  # noqa: BLE001
         print(f"  device         unavailable: {exc}")
-    from vllm_ascend.device.hardware_profile import get_hardware_profile
     from vllm_ascend.utils import enable_custom_op
 
     print(f"  custom ops     {enable_custom_op()}")
     try:
-        print(f"  hw profile     {get_hardware_profile()}")
+        from vllm_ascend.device.hardware_profile import get_current_hardware_profile
+
+        profile = get_current_hardware_profile()
+        print(f"  device type    {profile._device_type}")
+        print(f"  capabilities   {sorted(c.name for c in profile.capabilities)}")
     except Exception as exc:  # noqa: BLE001
-        print(f"  hw profile     unavailable: {exc}")
+        print(f"  hw profile     unavailable: {type(exc).__name__}: {exc}")
 
     banner("op availability")
     for op in (
@@ -206,61 +219,108 @@ def probe_lightning_indexer(num_heads: int) -> None:
     print(f"        valid-before-invalid padding: {monotone}")
 
 
-def probe_sparse_attention(rope_head_dim: int, kv_head_dim: int = 512) -> None:
-    banner(f"npu_sparse_flash_attention  (sparse_block_size = {INDEX_KPOOL}, rope_head_dim = {rope_head_dim})")
-    torch.manual_seed(0)
+def sparse_attention_variant(
+    *,
+    num_heads: int = 16,
+    nope_dim: int = 512,
+    rope_dim: int = 64,
+    sparse_block_size: int = 1,
+    attention_mode: int = 2,
+    layout_query: str = "TND",
+    cumulative_query_lens: bool = True,
+    kv_quant: bool = False,
+) -> tuple[torch.Tensor, str]:
+    """Call the sparse attention once, mirroring vllm-ascend's own call shape.
 
-    num_query_heads = 8
+    The baseline reproduces ``BaseDeviceAdaptor._execute_sparse_flash_attention``
+    (token-granular indices, separate nope/rope caches, ``attention_mode=2``);
+    every probe below perturbs exactly one argument off that baseline so a
+    failure names the unsupported feature rather than the call.
+    """
+    torch.manual_seed(0)
     kv_block_size = 64  # model-wide cache block_size, token-granular
     seq_len = 200
-    num_tokens = 2
-    sparse_count = 16  # in pools
+    query_lens = [1, 1]
+    num_tokens = sum(query_lens)
+    # sparse_size counts blocks of `sparse_block_size` tokens each.
+    sparse_size = 64 // sparse_block_size
 
     blocks = (seq_len + kv_block_size - 1) // kv_block_size
-    query = torch.randn(num_tokens, num_query_heads, kv_head_dim, dtype=torch.bfloat16)
-    kv_pages = torch.randn(blocks, kv_block_size, 1, kv_head_dim, dtype=torch.bfloat16)
-    block_table = torch.arange(blocks, dtype=torch.int32).reshape(1, blocks).repeat(num_tokens, 1)
+    query = torch.randn(num_tokens, num_heads, nope_dim, dtype=torch.bfloat16).npu()
+    kv_pages = torch.randn(blocks, kv_block_size, 1, nope_dim, dtype=torch.bfloat16).npu()
+    block_table = torch.arange(blocks, dtype=torch.int32).reshape(1, blocks).repeat(len(query_lens), 1).npu()
+    # Valid ids first, then -1, exactly as npu_lightning_indexer emits them.
+    indices = torch.arange(sparse_size, dtype=torch.int32).reshape(1, 1, sparse_size).repeat(num_tokens, 1, 1).npu()
+    lens = torch.tensor(query_lens, dtype=torch.int32)
+    seq_lens_query = (lens.cumsum(0) if cumulative_query_lens else lens).to(torch.int32).npu()
+    seq_lens_kv = torch.full((len(query_lens),), seq_len, dtype=torch.int32).npu()
 
-    # Pool ids, valid first then -1, exactly as the indexer emits them.
-    pool_ids = torch.arange(sparse_count, dtype=torch.int32).reshape(1, 1, sparse_count).repeat(num_tokens, 1, 1)
-    seq_lens_query = torch.tensor([1, 2], dtype=torch.int32)
-    seq_lens_kv = torch.tensor([seq_len, seq_len], dtype=torch.int32)
-
-    kwargs = dict(
-        sparse_indices=pool_ids.npu(),
-        scale_value=kv_head_dim**-0.5,
-        block_table=block_table.npu(),
-        actual_seq_lengths_query=seq_lens_query.npu(),
-        actual_seq_lengths_kv=seq_lens_kv.npu(),
-        sparse_block_size=INDEX_KPOOL,
-        layout_query="TND",
+    shared = dict(
+        sparse_indices=indices,
+        scale_value=(nope_dim + rope_dim) ** -0.5,
+        block_table=block_table,
+        actual_seq_lengths_query=seq_lens_query,
+        actual_seq_lengths_kv=seq_lens_kv,
+        sparse_block_size=sparse_block_size,
+        layout_query=layout_query,
         layout_kv="PA_BSND",
         sparse_mode=3,
+        attention_mode=attention_mode,
     )
-    if rope_head_dim:
-        kwargs["query_rope"] = torch.randn(num_tokens, num_query_heads, rope_head_dim, dtype=torch.bfloat16).npu()
-        kwargs["key_rope"] = torch.randn(blocks, kv_block_size, 1, rope_head_dim, dtype=torch.bfloat16).npu()
+    if kv_quant:
+        # The quantized op takes one fused query and derives the rope split.
+        out = torch_npu.npu_kv_quant_sparse_flash_attention(
+            query,
+            kv_pages,
+            kv_pages,
+            key_quant_mode=2,
+            value_quant_mode=2,
+            quant_scale_repo_mode=1,
+            tile_size=128,
+            rope_head_dim=rope_dim,
+            **shared,
+        )
+    else:
+        if rope_dim:
+            shared["query_rope"] = torch.randn(num_tokens, num_heads, rope_dim, dtype=torch.bfloat16).npu()
+            shared["key_rope"] = torch.randn(blocks, kv_block_size, 1, rope_dim, dtype=torch.bfloat16).npu()
+        out = torch_npu.npu_sparse_flash_attention(query, kv_pages, kv_pages, **shared)
 
-    def run():
-        out = torch_npu.npu_sparse_flash_attention(query.npu(), kv_pages.npu(), kv_pages.npu(), **kwargs)
-        return out[0] if isinstance(out, tuple) else out
+    out = out[0] if isinstance(out, tuple) else out
+    return out, f"shape {tuple(out.shape)}, finite {bool(torch.isfinite(out.float()).all())}"
 
-    result = report(f"sparse_block_size={INDEX_KPOOL}, nope_dim={kv_head_dim}", run)
-    if result is not None:
-        print(f"        output shape {tuple(result.shape)}, finite {bool(torch.isfinite(result.float()).all())}")
-        print("        -> pool ids can go straight to attention; no pool->token expansion needed")
+
+def probe_sparse_attention() -> None:
+    banner("npu_sparse_flash_attention  (single-axis sweep off vllm-ascend's own call)")
+    # Ordered so the baseline lands first: if it fails, nothing below is
+    # interpretable and the call shape itself is what needs fixing.
+    variants: list[tuple[str, dict]] = [
+        ("baseline: heads=16 rope=64 sbs=1 mode=2", {}),
+        ("query lens NOT cumulative", {"cumulative_query_lens": False}),
+        ("attention_mode=0", {"attention_mode": 0}),
+        ("heads=128", {"num_heads": 128}),
+        ("layout_query=BSND", {"layout_query": "BSND"}),
+        # The two questions that decide the GLM design.
+        (f"sparse_block_size={INDEX_KPOOL}  <-- pool ids direct", {"sparse_block_size": INDEX_KPOOL}),
+        ("rope_dim=0  <-- GLM is NoPE MLA", {"rope_dim": 0}),
+        (
+            f"rope_dim=0 + sparse_block_size={INDEX_KPOOL}  <-- what GLM wants",
+            {"rope_dim": 0, "sparse_block_size": INDEX_KPOOL},
+        ),
+        (f"kv_quant op, sparse_block_size={INDEX_KPOOL}", {"kv_quant": True, "sparse_block_size": INDEX_KPOOL}),
+    ]
+    for name, overrides in variants:
+        result = report(name, lambda o=overrides: sparse_attention_variant(**o))
+        if result is not None:
+            print(f"        {result[1]}")
 
 
 def main() -> None:
     env_report()
-    # 16 is what this checkpoint ships; 64 is what the op's own tests cover, so
-    # a 16-only failure means the DeepGEMM head padding is needed here too.
-    for num_heads in (16, 64):
-        probe_lightning_indexer(num_heads)
-    # GLM-5.3-Flash MLA is NoPE, so the no-rope call is the one that matters;
-    # the 64-dim call tells us whether the op simply requires the split.
-    for rope_head_dim in (0, 64):
-        probe_sparse_attention(rope_head_dim)
+    # Already confirmed on Ascend950PR: bf16 pool-granular keys score correctly
+    # at index_n_heads=16, so keep one run as a regression check only.
+    probe_lightning_indexer(16)
+    probe_sparse_attention()
     print("\nDone. Paste the whole output back.")
 
 
