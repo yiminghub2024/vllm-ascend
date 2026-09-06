@@ -113,6 +113,13 @@ def select_token_ids(
     """
     assert topk_tokens % pool_size == 0, (topk_tokens, pool_size)
 
+    # The MLA metadata builder keeps these two on the host, but the operator
+    # rejects length arguments that do not sit with its other tensors. Both are
+    # one int per request, so the copy is small and asynchronous -- unlike a
+    # read in the other direction, which would stall the step.
+    query_lens = query_lens.to(query.device)
+    seq_lens = seq_lens.to(query.device)
+
     selectable = shared_pool_prefix(seq_lens, query_lens, pool_size)
     pool_ids = score_and_select_pools(
         query,
@@ -125,8 +132,9 @@ def select_token_ids(
     )
 
     # The operator answers per query row, so the request-granular boundary and
-    # sequence length both have to be spread out to one entry per row.
-    rows = torch.repeat_interleave(query_lens.to(torch.int64))
+    # sequence length both have to be spread out to one entry per row. The width
+    # is passed in because deriving it from a device tensor is a host read.
+    rows = torch.repeat_interleave(query_lens.to(torch.int64), output_size=query.shape[0])
     return expand_pools_and_append_tail(
         pool_ids.reshape(query.shape[0], -1),
         row_seq_lens(seq_lens, query_lens, rows=rows),
