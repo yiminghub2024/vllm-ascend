@@ -4270,6 +4270,30 @@ class NPUModelRunner(GPUModelRunner):
             return True
         return isinstance(spec, KpoolTailSpec)
 
+    def _kpool_indexer_cache_shape(
+        self,
+        attn_backend,
+        kv_cache_spec: AttentionSpec,
+        num_blocks: int,
+        storage_block_size: int,
+    ) -> tuple[int, ...]:
+        """Ask the indexer backend for its cache shape, dtype hint optional."""
+        try:
+            return attn_backend.get_kv_cache_shape(
+                num_blocks,
+                storage_block_size,
+                kv_cache_spec.num_kv_heads,
+                kv_cache_spec.head_size,
+                cache_dtype_str=getattr(kv_cache_spec, "cache_dtype_str", "auto") or "auto",
+            )
+        except TypeError:
+            return attn_backend.get_kv_cache_shape(
+                num_blocks,
+                storage_block_size,
+                kv_cache_spec.num_kv_heads,
+                kv_cache_spec.head_size,
+            )
+
     def _get_attention_kv_cache_dims(self, layer_name: str, kv_cache_spec: AttentionSpec) -> tuple[int, int]:
         if isinstance(kv_cache_spec, AscendMLAAttentionSpec):
             attn_layers = get_layers_from_vllm_config(
@@ -4754,20 +4778,21 @@ class NPUModelRunner(GPUModelRunner):
                     storage_block_size = getattr(
                         current_kv_cache_spec, "storage_block_size", current_kv_cache_spec.block_size
                     )
-                    try:
-                        kv_cache_shape = attn_backend.get_kv_cache_shape(
+                    if isinstance(current_kv_cache_spec, KpoolTailSpec):
+                        # KpoolTailBackend publishes no shape of its own: the
+                        # ring's layout is the generic
+                        # [block, head, state, content] view its spec already
+                        # describes, the two heads being raw K and the gate
+                        # score.
+                        kv_cache_shape = (
                             num_blocks,
-                            storage_block_size,
                             current_kv_cache_spec.num_kv_heads,
+                            current_kv_cache_spec.block_size,
                             current_kv_cache_spec.head_size,
-                            cache_dtype_str=getattr(current_kv_cache_spec, "cache_dtype_str", "auto") or "auto",
                         )
-                    except TypeError:
-                        kv_cache_shape = attn_backend.get_kv_cache_shape(
-                            num_blocks,
-                            storage_block_size,
-                            current_kv_cache_spec.num_kv_heads,
-                            current_kv_cache_spec.head_size,
+                    else:
+                        kv_cache_shape = self._kpool_indexer_cache_shape(
+                            attn_backend, current_kv_cache_spec, num_blocks, storage_block_size
                         )
                     raw_typed = raw_tensor.view(current_kv_cache_spec.dtype)
                     page_size_padded = getattr(current_kv_cache_spec, "page_size_padded", None)
