@@ -231,6 +231,7 @@ class AscendKpoolMLAImpl(AscendMLAImpl):
                 tail_slots=tail_slots.view(num_requests, rows),
                 positions=positions.view(num_requests, rows),
                 pool_size=self.index_kpool,
+                pools_per_block=self.indexer.k_cache.pools_per_block,
             )
         else:
             write_prefill(
@@ -242,6 +243,7 @@ class AscendKpoolMLAImpl(AscendMLAImpl):
                 pool_slots=pool_slots,
                 tail_slots=tail_slots,
                 pool_size=self.index_kpool,
+                pools_per_block=self.indexer.k_cache.pools_per_block,
             )
 
         if not score:

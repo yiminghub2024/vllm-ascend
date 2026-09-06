@@ -12,6 +12,8 @@ HEAD_DIM = 128
 POOL_SIZE = 4
 POOLS_PER_BLOCK = 2
 NUM_BLOCKS = 16
+# How far past its own block unification pads a page in the padded fixtures.
+PAGE_PAD_FACTOR = 8
 
 
 def _caches(dtype: torch.dtype = torch.bfloat16) -> tuple[torch.Tensor, torch.Tensor]:
@@ -96,6 +98,7 @@ def test_prefill_compresses_every_complete_pool(sequence):
         pool_slots=pool_slots,
         tail_slots=tail_slots,
         pool_size=POOL_SIZE,
+        pools_per_block=POOLS_PER_BLOCK,
     )
 
     expected = _reference_index_cache(keys, gate_scores, position_bias, block_table)
@@ -125,6 +128,7 @@ def test_prefill_seeds_the_ring_with_the_last_pool_of_tokens(sequence):
         pool_slots=pool_slots,
         tail_slots=tail_slots,
         pool_size=POOL_SIZE,
+        pools_per_block=POOLS_PER_BLOCK,
     )
 
     ring = tail_cache[1]
@@ -152,6 +156,7 @@ def test_prefill_leaves_the_cache_alone_when_no_pool_completes(sequence):
         pool_slots=pool_slots,
         tail_slots=tail_slots,
         pool_size=POOL_SIZE,
+        pools_per_block=POOLS_PER_BLOCK,
     )
 
     assert torch.all(index_cache[1:] == 7.0)
@@ -182,6 +187,7 @@ def test_decode_through_the_ring_matches_a_single_prefill(sequence, prefill_leng
         pool_slots=pool_slots,
         tail_slots=tail_slots,
         pool_size=POOL_SIZE,
+        pools_per_block=POOLS_PER_BLOCK,
     )
 
     for start in range(prefill_length, length, tokens_per_step):
@@ -197,10 +203,79 @@ def test_decode_through_the_ring_matches_a_single_prefill(sequence, prefill_leng
             tail_slots=step_tail_slots.unsqueeze(0),
             positions=torch.tensor(positions, dtype=torch.int32).unsqueeze(0),
             pool_size=POOL_SIZE,
+            pools_per_block=POOLS_PER_BLOCK,
         )
 
     expected = _reference_index_cache(keys, gate_scores, position_bias, block_table)
     _assert_pools_match(index_cache, expected)
+
+
+def _padded_caches(dtype: torch.dtype = torch.bfloat16) -> tuple[torch.Tensor, torch.Tensor]:
+    """Caches whose pages unification padded out past the block they hold.
+
+    The indexer page grows along its pool axis and the ring page along its
+    state axis, which is how vLLM folds ``page_size_padded`` into the shape.
+    """
+    index_cache = torch.full((NUM_BLOCKS, POOLS_PER_BLOCK * PAGE_PAD_FACTOR, HEAD_DIM), 7.0, dtype=dtype)
+    tail_cache = torch.full((NUM_BLOCKS, 2, POOL_SIZE * PAGE_PAD_FACTOR, HEAD_DIM), 7.0, dtype=dtype)
+    return index_cache, tail_cache
+
+
+def test_padding_a_page_does_not_move_where_a_write_lands(sequence):
+    """A slot is numbered by the spec's block size, not the padded page width.
+
+    Unifying page sizes across the cache groups pads both of these pages out to
+    the much wider MLA one, so a page carries its block's entries at the front
+    and padding behind them. Indexing the allocation flat instead would walk
+    pages at the unpadded width and land every write in a page nothing reads --
+    which no operator rejects, so the only symptom would be worse answers.
+    """
+    keys, gate_scores, position_bias = sequence
+    block_table = [3, 5, 8, 11, 12]
+    length = keys.shape[0]
+    prefill_length = 20
+
+    plain, padded = _caches(), _padded_caches()
+    for index_cache, tail_cache in (plain, padded):
+        pool_slots, tail_slots = _slot_mappings(list(range(prefill_length)), block_table, tail_block=1)
+        write_prefill(
+            index_cache,
+            tail_cache,
+            keys[:prefill_length],
+            gate_scores[:prefill_length],
+            position_bias,
+            pool_slots=pool_slots,
+            tail_slots=tail_slots,
+            pool_size=POOL_SIZE,
+            pools_per_block=POOLS_PER_BLOCK,
+        )
+        # Decode too: it reads the ring back to finish a boundary pool, so a
+        # misread page would corrupt exactly the pools that span two steps.
+        for position in range(prefill_length, length):
+            step_pool_slots, step_tail_slots = _slot_mappings([position], block_table, tail_block=1)
+            write_decode(
+                index_cache,
+                tail_cache,
+                keys[position].view(1, 1, HEAD_DIM),
+                gate_scores[position].view(1, 1, HEAD_DIM),
+                position_bias,
+                pool_slots=step_pool_slots.view(1, 1),
+                tail_slots=step_tail_slots.view(1, 1),
+                positions=torch.tensor([[position]], dtype=torch.int32),
+                pool_size=POOL_SIZE,
+                pools_per_block=POOLS_PER_BLOCK,
+            )
+
+    _assert_pools_match(padded[0][:, :POOLS_PER_BLOCK], plain[0])
+    torch.testing.assert_close(padded[1][1:, :, :POOL_SIZE], plain[1][1:])
+    # And the padding itself is never touched.
+    assert (padded[0][:, POOLS_PER_BLOCK:] == 7.0).all()
+    assert (padded[1][:, :, POOL_SIZE:] == 7.0).all()
+
+    # The whole point: this is the answer an unpadded page produces.
+    _assert_pools_match(
+        padded[0][:, :POOLS_PER_BLOCK], _reference_index_cache(keys, gate_scores, position_bias, block_table)
+    )
 
 
 def test_decode_keeps_concurrent_requests_apart(sequence):
@@ -226,6 +301,7 @@ def test_decode_keeps_concurrent_requests_apart(sequence):
             pool_slots=pool_slots,
             tail_slots=tail_slots,
             pool_size=POOL_SIZE,
+            pools_per_block=POOLS_PER_BLOCK,
         )
 
     for step in range(8):
@@ -246,6 +322,7 @@ def test_decode_keeps_concurrent_requests_apart(sequence):
             tail_slots=batch_tail_slots,
             positions=torch.tensor(positions, dtype=torch.int32).unsqueeze(1),
             pool_size=POOL_SIZE,
+            pools_per_block=POOLS_PER_BLOCK,
         )
 
     for request, block_table in enumerate(block_tables):
@@ -280,6 +357,7 @@ def test_decode_ignores_padded_requests(sequence):
         pool_slots=pool_slots,
         tail_slots=tail_slots,
         pool_size=POOL_SIZE,
+        pools_per_block=POOLS_PER_BLOCK,
     )
     before = index_cache.clone()
 
@@ -298,6 +376,7 @@ def test_decode_ignores_padded_requests(sequence):
             tail_slots=torch.tensor([[step_tail_slots[0]], [-1]], dtype=torch.int32),
             positions=torch.tensor([[position], [0]], dtype=torch.int32),
             pool_size=POOL_SIZE,
+            pools_per_block=POOLS_PER_BLOCK,
         )
 
     # Only the pool ending at position 19 changed; the padded row wrote nothing.
@@ -329,4 +408,5 @@ def test_writes_are_free_of_host_reads(sequence, monkeypatch):
         tail_slots=torch.tensor([[4, 5, 6, 7], [8, 9, 10, 11]], dtype=torch.int32),
         positions=torch.tensor([[16, 17, 18, 19], [20, 21, 22, 23]], dtype=torch.int32),
         pool_size=POOL_SIZE,
+        pools_per_block=POOLS_PER_BLOCK,
     )

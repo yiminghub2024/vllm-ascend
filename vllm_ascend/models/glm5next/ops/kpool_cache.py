@@ -35,31 +35,56 @@ import torch
 from vllm_ascend.models.glm5next.ops.kpool_compress import compress_pool
 
 
-def _scatter_pools(index_cache: torch.Tensor, pooled: torch.Tensor, pool_slots: torch.Tensor) -> None:
+def _pool_pages(index_cache: torch.Tensor, head_dim: int, pools_per_block: int) -> torch.Tensor:
+    """The pooled cache as ``[pages, pools_per_block, head_dim]``.
+
+    vLLM numbers a slot ``page * block_states + offset`` using the spec's own
+    block size, never the allocated page's width, so a page that page-size
+    unification padded out to the MLA one still has to be indexed by its
+    leading axis. Flattening the cache instead would walk pages at the
+    unpadded width and scatter the writes across pages nothing reads.
+    """
+    pages = index_cache.shape[0]
+    flat = index_cache.reshape(pages, -1, head_dim)
+    if flat.shape[1] < pools_per_block:
+        raise RuntimeError(
+            f"kpool indexer page holds {flat.shape[1]} pools, fewer than the "
+            f"{pools_per_block} one scheduler block addresses."
+        )
+    # The padding follows the block's pools, so narrowing keeps the page stride.
+    return flat[:, :pools_per_block]
+
+
+def _scatter_pools(
+    index_cache: torch.Tensor,
+    pooled: torch.Tensor,
+    pool_slots: torch.Tensor,
+    pools_per_block: int,
+) -> None:
     """Write pool entries at ``pool_slots``, sending negative slots to slot 0."""
     head_dim = pooled.shape[-1]
-    entries = index_cache.view(-1, head_dim)
+    entries = _pool_pages(index_cache, head_dim, pools_per_block)
     destinations = pool_slots.reshape(-1).clamp_min(0).to(torch.int64)
-    entries.index_copy_(0, destinations, pooled.reshape(-1, head_dim).to(entries.dtype))
+    entries[destinations // pools_per_block, destinations % pools_per_block] = pooled.reshape(-1, head_dim).to(
+        entries.dtype
+    )
 
 
 def _tail_ring(tail_cache: torch.Tensor, pool_size: int, head_dim: int) -> torch.Tensor:
-    """View the tail cache as ``[blocks, 2, pool_size, head_dim]``.
+    """The ring as ``[pages, 2, pool_size, head_dim]``.
 
-    The slot mapping counts blocks the way the allocation does, so a page wider
-    than one ring block would make this view invent blocks the mapping never
-    names and every write would land in the wrong one. Page-size unification
-    pads the sibling indexer cache out to the MLA page; check rather than
-    assume that it left this one alone.
+    Same story as ``_pool_pages``: the ring slots are numbered by the spec's
+    block size, so the page axis of the allocation is what a slot's block
+    refers to, however wide unification made the page.
     """
-    ring = tail_cache.view(-1, 2, pool_size, head_dim)
-    if ring.shape[0] != tail_cache.shape[0]:
+    if tail_cache.ndim != 4 or tail_cache.shape[1] != 2 or tail_cache.shape[-1] != head_dim:
+        raise RuntimeError(f"kpool tail cache must be [pages, 2, states, {head_dim}], got {tuple(tail_cache.shape)}")
+    states = tail_cache.shape[2]
+    if states < pool_size:
         raise RuntimeError(
-            f"kpool tail cache {tuple(tail_cache.shape)} holds {ring.shape[0]} "
-            f"ring blocks across {tail_cache.shape[0]} pages, so its page is "
-            "padded past one block and the tail slot mapping no longer indexes it."
+            f"kpool tail cache page holds {states} states, fewer than the {pool_size} a ring block needs."
         )
-    return ring
+    return tail_cache[:, :, :pool_size]
 
 
 def _stash_tail(
@@ -94,6 +119,7 @@ def write_prefill(
     pool_slots: torch.Tensor,
     tail_slots: torch.Tensor | None,
     pool_size: int,
+    pools_per_block: int,
 ) -> None:
     """Compress a prefill batch's complete pools and seed each request's ring.
 
@@ -109,6 +135,8 @@ def write_prefill(
             pool, and padding, carry negatives.
         tail_slots: ``[num_tokens]`` -- token-granular ring slot mapping.
         pool_size: the checkpoint's ``index_kpool``.
+        pools_per_block: pools one scheduler block addresses, which is the
+            stride the slot mappings above are numbered with.
 
     Chunk starts are assumed pool-aligned, which is what makes every token a
     pool-completion candidate whose members are the ``pool_size`` tokens ending
@@ -128,7 +156,7 @@ def write_prefill(
     # A pool whose start falls before the batch was gathered from clamped
     # indices, so drop it however its slot reads.
     completed = torch.where(batch_positions >= pool_size - 1, pool_slots, torch.full_like(pool_slots, -1))
-    _scatter_pools(index_cache, pooled, completed)
+    _scatter_pools(index_cache, pooled, completed, pools_per_block)
 
     if tail_cache is not None and tail_slots is not None:
         _stash_tail(tail_cache, keys, gate_scores, _tail_only(tail_slots, pool_size), pool_size)
@@ -169,6 +197,7 @@ def write_decode(
     tail_slots: torch.Tensor,
     positions: torch.Tensor,
     pool_size: int,
+    pools_per_block: int,
 ) -> None:
     """Advance each request's ring and compress the pools that complete.
 
@@ -183,6 +212,8 @@ def write_decode(
         positions: ``[num_requests, tokens_per_request]`` -- token-granular
             positions, which is what the pool phase is derived from.
         pool_size: the checkpoint's ``index_kpool``.
+        pools_per_block: pools one scheduler block addresses, which is the
+            stride ``pool_slots`` is numbered with.
 
     A request's tokens must be applied in position order, because a pool
     completing at one token needs the tokens before it. The loop below runs over
@@ -226,6 +257,7 @@ def write_decode(
             index_cache,
             compress_pool(member_keys, member_gates, position_bias),
             torch.where(completes, pool_slot, torch.full_like(pool_slot, -1)),
+            pools_per_block,
         )
 
         # --- stash this token, after the read above --------------------------
