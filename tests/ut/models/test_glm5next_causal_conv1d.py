@@ -1,14 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 """The GLM-5.3-Flash KDA convolution entry points.
 
-These wrappers exist so the KDA layer reaches ``npu_causal_conv1d_custom``,
-whose per-request bookkeeping stays on device. The PyTorch fallback instead
-reads ``query_start_loc`` with ``.item()`` per request, and a host sync is
-rejected outright while an ACL graph is being captured, so decode-FULL capture
-aborts whenever a call slips onto the fallback. What the fused operator needs is
-therefore pinned here: the merged weight in its ``[width, 3C]`` kernel layout,
-the mode selectors, and the state-index tensor it reads. The fallback's own
-argument shapes are pinned alongside, since it takes different layouts.
+The decode / draft-verify update has to advance every request's conv state
+without reading a device tensor on the host: a host sync is rejected outright
+while an ACL graph is being captured, so one ``.item()`` aborts decode-FULL
+capture. Where the fused Ascend operator is unavailable -- A5 withholds
+``RUNTIME_CUSTOM_OPS``, so custom ops are off there entirely -- a batched torch
+expression stands in for it, and the bulk of this file checks that expression
+against the per-request implementation it replaces, since the two have to agree
+on rejection rollback and on which requests are inert.
+
+The rest pins what the fused operator is handed, because its layouts differ
+from the fallback's in every argument.
 """
 
 from __future__ import annotations
@@ -23,15 +26,17 @@ from vllm_ascend.models.glm5next.ops.causal_conv1d import (
     _ACTIVATION_SILU,
     _RUN_MODE_UPDATE,
     _RUN_MODE_VARLEN,
+    _batched_causal_conv1d_update,
     causal_conv1d_fn,
     causal_conv1d_update,
 )
+from vllm_ascend.ops.causal_conv1d import (
+    causal_conv1d_update as per_request_causal_conv1d_update,
+)
 
-NUM_TOKENS = 6
-MERGED_DIM = 12
 CONV_WIDTH = 4
-NUM_ROWS = 2
-DRAFT_SLOTS = 3
+MERGED_DIM = 24
+NUM_SLOTS = 8
 
 
 @pytest.fixture
@@ -49,36 +54,175 @@ def fused_op_calls(monkeypatch) -> list[dict]:
         types.SimpleNamespace(npu_causal_conv1d_custom=npu_causal_conv1d_custom),
         raising=False,
     )
+    monkeypatch.setattr(conv1d_module, "has_fused_conv1d", lambda: True)
     return calls
 
 
 @pytest.fixture
 def without_fused_op(monkeypatch) -> None:
-    monkeypatch.setattr(conv1d_module, "_has_fused_conv1d", lambda: False)
+    monkeypatch.setattr(conv1d_module, "has_fused_conv1d", lambda: False)
 
 
-def _inputs() -> dict[str, torch.Tensor]:
+# (query_lens, num_accepted_tokens, num_spec)
+UPDATE_CASES = {
+    # Plain decode: one token per request.
+    "decode": ([1, 1, 1, 1], None, 0),
+    # Requests the metadata builder padded away carry zero-length ranges and
+    # all point at the same null block, so they must stay inert.
+    "decode-padded": ([1, 1, 0, 0], None, 0),
+    "verify-all-accepted": ([4, 4, 4], [4, 4, 4], 3),
+    # Rejected drafts must not advance the state, including a request whose
+    # very first draft token was rejected.
+    "verify-rejections": ([4, 4, 4], [1, 3, 0], 3),
+    "verify-padded": ([4, 4, 0, 0], [2, 4, 1, 1], 3),
+}
+
+
+def _update_inputs(query_lens, num_accepted, num_spec, *, state_dim_first, dtype):
+    state_len = CONV_WIDTH - 1
+    num_requests = len(query_lens)
+    num_tokens = sum(query_lens)
+    is_verify = num_accepted is not None
+
+    x = torch.randn(num_tokens, MERGED_DIM, dtype=dtype)
+    # The kernel layout is [width, dim]; vLLM keeps the checkpoint copy in fp32.
+    weight = torch.randn(CONV_WIDTH, MERGED_DIM, dtype=torch.float32)
+    query_start_loc = torch.tensor(
+        [0, *torch.cumsum(torch.tensor(query_lens), 0).tolist()],
+        dtype=torch.int32,
+    )
+    state_slots = torch.arange(1, num_requests + 1, dtype=torch.int32) % NUM_SLOTS
+    # On the speculative path the state index tensor carries one column per
+    # draft slot, and only the first column names the conv state.
+    max_query_len = num_spec + 1 if is_verify else 1
+    cache_indices = (
+        state_slots.unsqueeze(1).expand(num_requests, max_query_len).contiguous() if is_verify else state_slots
+    )
+
+    # The cache is allocated state_len + num_spec wide to leave room for the
+    # draft slots, and can be oriented either way round.
+    allocated = state_len + num_spec
+    per_slot = (MERGED_DIM, allocated) if state_dim_first else (allocated, MERGED_DIM)
+    conv_state = torch.randn(NUM_SLOTS, *per_slot, dtype=dtype)
+
     return {
-        "x": torch.randn(NUM_TOKENS, MERGED_DIM),
-        "conv_state": torch.zeros(NUM_ROWS + 1, CONV_WIDTH - 1, MERGED_DIM),
-        # [width, 3C]: the layout the fused operator consumes.
+        "x": x,
+        "weight": weight,
+        "conv_state": conv_state,
+        "query_start_loc": query_start_loc,
+        "state_slots": state_slots,
+        "cache_indices": cache_indices,
+        "num_accepted_tokens": (torch.tensor(num_accepted, dtype=torch.int32) if is_verify else None),
+    }
+
+
+@pytest.mark.parametrize("case", UPDATE_CASES.keys())
+@pytest.mark.parametrize("state_dim_first", [False, True], ids=["state-major", "dim-major"])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
+def test_batched_update_matches_the_per_request_implementation(case, state_dim_first, dtype) -> None:
+    torch.manual_seed(0)
+    inputs = _update_inputs(*UPDATE_CASES[case], state_dim_first=state_dim_first, dtype=dtype)
+
+    expected_state = inputs["conv_state"].clone()
+    expected = per_request_causal_conv1d_update(
+        inputs["x"].clone(),
+        expected_state,
+        # The per-request implementation takes the transposed weight, and
+        # convolves in the weight dtype.
+        inputs["weight"].transpose(0, 1),
+        None,
+        activation="silu",
+        conv_state_indices=inputs["state_slots"],
+        num_accepted_tokens=inputs["num_accepted_tokens"],
+        query_start_loc=inputs["query_start_loc"],
+    )
+
+    actual_state = inputs["conv_state"].clone()
+    actual = _batched_causal_conv1d_update(
+        inputs["x"].clone(),
+        actual_state,
+        inputs["weight"],
+        None,
+        query_start_loc=inputs["query_start_loc"],
+        cache_indices=inputs["cache_indices"],
+        num_accepted_tokens=inputs["num_accepted_tokens"],
+    )
+
+    tolerance = 3e-3 if dtype is torch.bfloat16 else 1e-5
+    torch.testing.assert_close(actual, expected, rtol=0, atol=tolerance)
+    torch.testing.assert_close(actual_state, expected_state, rtol=0, atol=tolerance)
+
+
+def test_batched_update_leaves_untouched_slots_alone(without_fused_op) -> None:
+    """Only the slots the batch names may move."""
+    torch.manual_seed(0)
+    inputs = _update_inputs(*UPDATE_CASES["verify-rejections"], state_dim_first=False, dtype=torch.float32)
+    conv_state = inputs["conv_state"].clone()
+    before = conv_state.clone()
+
+    causal_conv1d_update(
+        inputs["x"],
+        conv_state,
+        inputs["weight"],
+        None,
+        query_start_loc=inputs["query_start_loc"],
+        cache_indices=inputs["cache_indices"],
+        num_accepted_tokens=inputs["num_accepted_tokens"],
+    )
+
+    named = set(inputs["state_slots"].tolist())
+    untouched = [slot for slot in range(NUM_SLOTS) if slot not in named]
+    assert untouched, "the fixture should leave some slots out of the batch"
+    torch.testing.assert_close(conv_state[untouched], before[untouched])
+    # The columns past state_len exist for the draft slots and stay put.
+    torch.testing.assert_close(conv_state[:, CONV_WIDTH - 1 :], before[:, CONV_WIDTH - 1 :])
+    # The request whose first draft token was rejected keeps its own state.
+    rejected = int(inputs["state_slots"][2])
+    torch.testing.assert_close(conv_state[rejected], before[rejected])
+
+
+def test_batched_update_is_free_of_host_reads(monkeypatch, without_fused_op) -> None:
+    """A single host read here would abort ACL graph capture."""
+    torch.manual_seed(0)
+    inputs = _update_inputs(*UPDATE_CASES["verify-rejections"], state_dim_first=False, dtype=torch.float32)
+
+    def forbidden(self, *args, **kwargs):
+        raise AssertionError("the batched update must not sync the host")
+
+    for method in ("item", "tolist"):
+        monkeypatch.setattr(torch.Tensor, method, forbidden, raising=True)
+
+    causal_conv1d_update(
+        inputs["x"],
+        inputs["conv_state"].clone(),
+        inputs["weight"],
+        None,
+        query_start_loc=inputs["query_start_loc"],
+        cache_indices=inputs["cache_indices"],
+        num_accepted_tokens=inputs["num_accepted_tokens"],
+    )
+
+
+def _fused_inputs() -> dict:
+    num_tokens = 6
+    return {
+        "x": torch.randn(num_tokens, MERGED_DIM),
+        "conv_state": torch.zeros(NUM_SLOTS, CONV_WIDTH - 1, MERGED_DIM),
         "weight": torch.randn(CONV_WIDTH, MERGED_DIM),
-        "bias": None,
-        "query_start_loc": torch.tensor([0, 3, NUM_TOKENS], dtype=torch.int32),
+        "query_start_loc": torch.tensor([0, 3, num_tokens], dtype=torch.int32),
     }
 
 
 def test_update_hands_the_fused_operator_its_own_layouts(fused_op_calls) -> None:
-    inputs = _inputs()
-    # The recurrent state index tensor carries one column per draft slot.
-    cache_indices = torch.arange(NUM_ROWS * DRAFT_SLOTS, dtype=torch.int32).reshape(NUM_ROWS, DRAFT_SLOTS)
+    inputs = _fused_inputs()
+    cache_indices = torch.arange(2 * 4, dtype=torch.int32).reshape(2, 4)
     num_accepted_tokens = torch.tensor([2, 1], dtype=torch.int32)
 
     out = causal_conv1d_update(
         inputs["x"],
         inputs["conv_state"],
         inputs["weight"],
-        inputs["bias"],
+        None,
         query_start_loc=inputs["query_start_loc"],
         cache_indices=cache_indices,
         num_accepted_tokens=num_accepted_tokens,
@@ -103,17 +247,16 @@ def test_update_hands_the_fused_operator_its_own_layouts(fused_op_calls) -> None
 
 
 def test_varlen_hands_the_fused_operator_token_major_input(fused_op_calls) -> None:
-    inputs = _inputs()
-    cache_indices = torch.tensor([0, 1], dtype=torch.int32)
+    inputs = _fused_inputs()
     initial_state_mode = torch.tensor([False, True])
 
     out = causal_conv1d_fn(
         inputs["x"],
         inputs["conv_state"],
         inputs["weight"],
-        inputs["bias"],
+        None,
         query_start_loc=inputs["query_start_loc"],
-        cache_indices=cache_indices,
+        cache_indices=torch.tensor([0, 1], dtype=torch.int32),
         initial_state_mode=initial_state_mode,
     )
 
@@ -121,47 +264,20 @@ def test_varlen_hands_the_fused_operator_token_major_input(fused_op_calls) -> No
     call = fused_op_calls[0]
     assert out is call["output"]
     # Token-major, unlike the fallback, which wants [dim, num_tokens].
-    assert call["x"].shape == (NUM_TOKENS, MERGED_DIM)
+    assert call["x"].shape == inputs["x"].shape
     assert call["weight"].shape == (CONV_WIDTH, MERGED_DIM)
     assert call["initial_state_mode_opt"] is initial_state_mode
     assert call["num_accepted_tokens_opt"] is None
     assert call["run_mode"] == _RUN_MODE_VARLEN
 
 
-def test_update_fallback_narrows_the_state_indices(monkeypatch, without_fused_op) -> None:
-    inputs = _inputs()
-    cache_indices = torch.arange(NUM_ROWS * DRAFT_SLOTS, dtype=torch.int32).reshape(NUM_ROWS, DRAFT_SLOTS)
-    captured: dict = {}
-
-    def fake_update(x, conv_state, weight, bias, **kwargs):
-        captured.update(x=x, weight=weight, **kwargs)
-        return torch.zeros_like(x)
-
-    monkeypatch.setattr(conv1d_module, "_torch_causal_conv1d_update", fake_update)
-
-    causal_conv1d_update(
-        inputs["x"],
-        inputs["conv_state"],
-        inputs["weight"],
-        inputs["bias"],
-        query_start_loc=inputs["query_start_loc"],
-        cache_indices=cache_indices,
-    )
-
-    # The fallback indexes conv_state per request, so only the column naming
-    # the conv state survives, and it wants the [3C, width] weight.
-    assert torch.equal(captured["conv_state_indices"], cache_indices[:, 0])
-    assert captured["weight"].shape == (MERGED_DIM, CONV_WIDTH)
-    assert captured["activation"] == "silu"
-
-
 def test_varlen_fallback_uses_channel_major_tokens(monkeypatch, without_fused_op) -> None:
-    inputs = _inputs()
+    inputs = _fused_inputs()
     captured: dict = {}
 
     def fake_fn(x, weight, bias, **kwargs):
         captured.update(x=x, weight=weight, **kwargs)
-        return torch.zeros(MERGED_DIM, NUM_TOKENS)
+        return torch.zeros(MERGED_DIM, x.shape[-1])
 
     monkeypatch.setattr(conv1d_module, "_torch_causal_conv1d_fn", fake_fn)
 
@@ -169,25 +285,36 @@ def test_varlen_fallback_uses_channel_major_tokens(monkeypatch, without_fused_op
         inputs["x"],
         inputs["conv_state"],
         inputs["weight"],
-        inputs["bias"],
+        None,
         query_start_loc=inputs["query_start_loc"],
         cache_indices=torch.tensor([0, 1], dtype=torch.int32),
         initial_state_mode=torch.tensor([False, True]),
     )
 
-    assert captured["x"].shape == (MERGED_DIM, NUM_TOKENS)
+    assert captured["x"].shape == (MERGED_DIM, inputs["x"].shape[0])
     assert captured["weight"].shape == (MERGED_DIM, CONV_WIDTH)
+    # The reference convolves in the weight dtype, so it has to stay fp32.
+    assert captured["weight"].dtype == torch.float32
     # Callers get token-major output back either way.
-    assert out.shape == (NUM_TOKENS, MERGED_DIM)
+    assert out.shape == inputs["x"].shape
 
 
-def test_packed_conv_weight_keeps_qkv_channel_order() -> None:
-    from vllm_ascend.models.glm5next.kda import Glm5NextLinearAttention
+@pytest.mark.parametrize(
+    ("fused_available", "expected_dtype"),
+    # The fused operator wants the activation dtype; the fallback convolves in
+    # the weight dtype, so it keeps the checkpoint's fp32.
+    [(True, torch.bfloat16), (False, torch.float32)],
+    ids=["fused", "fallback"],
+)
+def test_packed_conv_weight_keeps_qkv_channel_order(monkeypatch, fused_available, expected_dtype) -> None:
+    from vllm_ascend.models.glm5next import kda as kda_module
+
+    monkeypatch.setattr(kda_module, "has_fused_conv1d", lambda: fused_available)
 
     channels = MERGED_DIM // 3
     # vLLM stores each conv weight checkpoint-compatible as fp32 [C, 1, width].
     weights = [torch.randn(channels, 1, CONV_WIDTH) for _ in range(3)]
-    layer = object.__new__(Glm5NextLinearAttention)
+    layer = object.__new__(kda_module.Glm5NextLinearAttention)
     layer.q_conv1d, layer.k_conv1d, layer.v_conv1d = (types.SimpleNamespace(weight=weight) for weight in weights)
     layer.model_config = types.SimpleNamespace(dtype=torch.bfloat16)
     layer._packed_conv_weight = None
@@ -196,7 +323,7 @@ def test_packed_conv_weight_keeps_qkv_channel_order() -> None:
 
     packed = layer._packed_conv_weight
     assert packed.shape == (CONV_WIDTH, MERGED_DIM)
-    assert packed.dtype == torch.bfloat16
+    assert packed.dtype == expected_dtype
     assert packed.is_contiguous()
     expected = torch.cat([weight.view(channels, CONV_WIDTH) for weight in weights], dim=0)
-    assert torch.equal(packed.float(), expected.transpose(0, 1).to(torch.bfloat16).float())
+    torch.testing.assert_close(packed, expected.transpose(0, 1).to(expected_dtype))

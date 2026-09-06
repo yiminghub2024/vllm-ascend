@@ -36,6 +36,7 @@ from vllm_ascend.models.glm5next.config import Glm5NextConfig
 from vllm_ascend.models.glm5next.ops.causal_conv1d import (
     causal_conv1d_fn,
     causal_conv1d_update,
+    has_fused_conv1d,
 )
 from vllm_ascend.models.glm5next.ops.state_ops import (
     gather_initial_states,
@@ -305,19 +306,22 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         The 1D conv is independent per channel, so concatenating q/k/v along
         the channel dim and running a single convolution is bit-identical to
         three calls, and conv_state already holds the merged q|k|v state. vLLM
-        keeps the checkpoint-compatible FP32 ``[C, 1, width]`` weights, while
-        ``npu_causal_conv1d_custom`` consumes one activation-dtype
-        ``[width, 3C]`` tensor.
+        keeps these weights as checkpoint-compatible FP32 ``[C, 1, width]``.
+
+        ``npu_causal_conv1d_custom`` wants them in the activation dtype, but
+        where it is unavailable the convolution runs in the weight dtype, so
+        staying in FP32 there keeps the checkpoint's precision for free.
         """
         if any(conv.weight.is_meta for conv in self._conv_linears):
             return
+        kernel_dtype = self.model_config.dtype if has_fused_conv1d() else torch.float32
         self._packed_conv_weight = (
             torch.cat(
                 [conv.weight.view(conv.weight.size(0), conv.weight.size(2)) for conv in self._conv_linears],
                 dim=0,
             )
             .transpose(0, 1)
-            .to(dtype=self.model_config.dtype)
+            .to(dtype=kernel_dtype)
             .contiguous()
         )
 

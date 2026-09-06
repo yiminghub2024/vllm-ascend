@@ -9,7 +9,6 @@ fall back to the generic grouping path that cannot size GLM's pages.
 """
 
 import ast
-import io
 from pathlib import Path
 
 import pytest
@@ -20,7 +19,7 @@ DUPLICATED_NAMES = ("KpoolTailSpec", "KpoolTailManager")
 
 
 def _class_definitions(path):
-    tree = ast.parse(io.open(path, encoding="utf-8").read())
+    tree = ast.parse(path.read_text(encoding="utf-8"))
     return {node.name for node in ast.walk(tree) if isinstance(node, ast.ClassDef)}
 
 
@@ -45,7 +44,7 @@ def test_no_module_imports_the_class_from_a_local_path(name):
     offenders = [
         str(path.relative_to(VLLM_ASCEND_ROOT))
         for path in VLLM_ASCEND_ROOT.rglob("*.py")
-        for line in io.open(path, encoding="utf-8").read().splitlines()
+        for line in path.read_text(encoding="utf-8").splitlines()
         if pattern in line and "vllm_ascend" in line
     ]
 
