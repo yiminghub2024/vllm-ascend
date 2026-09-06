@@ -66,8 +66,12 @@ SPARSE_ROPE_DIM = 64
 # selected pools are expanded back into the tokens they were compressed from.
 SPARSE_BLOCK_SIZE = 1
 
-# RightDownCausal, matching vllm-ascend's own sparse attention call. A probe
-# confirmed attention_mode=0 is rejected outright.
+# Two independent axes that npu_sparse_flash_attention happens to name
+# similarly. ``sparse_mode`` picks the causal crop -- 3 is RightDownCausal,
+# which every other sparse-attention call in vllm-ascend uses and which the
+# probe exercised. ``attention_mode`` selects the MLA kernel; a probe confirmed
+# 0 is rejected outright.
+SPARSE_CAUSAL_MODE = 3
 SPARSE_ATTENTION_MODE = 2
 
 
@@ -276,23 +280,30 @@ class AscendKpoolMLAImpl(AscendMLAImpl):
         q_rope = _mla_nope_zero_rope(q_nope, SPARSE_ROPE_DIM, zero_rope_cache)
         k_rope = _mla_nope_zero_rope(key_cache, SPARSE_ROPE_DIM, zero_rope_cache)
 
-        return torch_npu.npu_sparse_flash_attention(
+        # The operator names the key-side length and layout ``*_kv``, not
+        # ``*_key``, and always answers with (attention_out, softmax_max,
+        # softmax_sum) even when the softmax terms are not asked for.
+        attn_output, _, _ = torch_npu.npu_sparse_flash_attention(
             query=q_nope,
             key=key_cache,
             value=key_cache,
-            sparse_indices=token_ids,
+            # The index list is laid out like the query, so TND wants a KV-head
+            # axis between the rows and the ids. The selection chain reports one
+            # row of ids per query row; the single MLA KV head is added here.
+            sparse_indices=token_ids.unsqueeze(1),
             scale_value=self.scale,
             sparse_block_size=SPARSE_BLOCK_SIZE,
             block_table=block_table,
             actual_seq_lengths_query=cumulative_query_lens,
-            actual_seq_lengths_key=seq_lens,
+            actual_seq_lengths_kv=seq_lens,
             query_rope=q_rope,
             key_rope=k_rope,
-            sparse_mode=SPARSE_ATTENTION_MODE,
+            sparse_mode=SPARSE_CAUSAL_MODE,
             attention_mode=SPARSE_ATTENTION_MODE,
             layout_query="TND",
-            layout_key="PA_BSND",
+            layout_kv="PA_BSND",
         )
+        return attn_output
 
     # ---- driving the phases ----------------------------------------------
 
