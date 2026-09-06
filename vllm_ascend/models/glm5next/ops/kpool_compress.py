@@ -143,26 +143,40 @@ def expand_pools_and_append_tail(
     pool_ids: torch.Tensor,
     seq_lens: torch.Tensor,
     pool_size: int,
+    *,
+    selectable_pools: torch.Tensor | None = None,
+    tail_width: int | None = None,
 ) -> torch.Tensor:
     """Turn selected pool ids into the token ids the sparse attention reads.
 
     Top-k runs at pool granularity, so it returns ``topk_tokens // pool_size``
     pool ids per query; each stands for the ``pool_size`` consecutive tokens it
-    was compressed from. Those get expanded back out, and then the request's
-    trailing pool is appended: it is still incomplete, so it was never
-    compressed into the index-K cache and cannot be selected -- but the newest
-    tokens must always be attended to, so they are appended unconditionally.
+    was compressed from. Those get expanded back out, and then the tokens after
+    the selectable prefix are appended: they were never compressed into the
+    index-K cache and so cannot be selected -- but they are the newest tokens,
+    which must always be attended to.
+
+    By default the appended tail is just the request's trailing incomplete
+    pool. ``selectable_pools`` widens it, which is what makes a shared
+    selection boundary usable: the operator applies one key length to every
+    query row it is given, so a batch whose rows sit at different positions has
+    to select over the prefix visible to *all* of them and cover the rest here.
 
     Args:
         pool_ids: ``[rows, topk_tokens // pool_size]`` -- selected pools per
             query row, negative where top-k found fewer pools than the budget.
         seq_lens: ``[rows]`` -- token-granular sequence length per query row.
         pool_size: tokens per pool (the checkpoint's ``index_kpool``).
+        selectable_pools: ``[rows]`` -- how many leading pools were offered to
+            top-k. Defaults to each row's own complete pool count, which is the
+            widest prefix a single row can select from.
+        tail_width: output width of the appended tail. Defaults to
+            ``pool_size - 1``, which is exactly enough for the default
+            ``selectable_pools``.
 
     Returns:
-        ``[rows, topk_tokens + pool_size - 1]`` int32 token ids, relative to the
-        start of each request and padded with ``-1``. The tail can never be
-        longer than ``pool_size - 1`` tokens, which fixes the output width.
+        ``[rows, topk_tokens + tail_width]`` int32 token ids, relative to the
+        start of each request and padded with ``-1``.
     """
     assert pool_ids.ndim == 2, pool_ids.shape
     assert seq_lens.ndim == 1, seq_lens.shape
@@ -176,13 +190,40 @@ def expand_pools_and_append_tail(
     history = pool_ids * pool_size + slot_offsets
     history = torch.where(pool_ids >= 0, history, -1).reshape(rows, num_groups * pool_size)
 
-    if pool_size == 1:
-        # Every token is its own pool, so there is no tail to append.
+    if tail_width is None:
+        tail_width = pool_size - 1
+    if tail_width == 0:
+        # Every token is its own pool and each row selects its own prefix, so
+        # there is nothing left over to append.
         return history.to(torch.int32)
 
     seq_lens = seq_lens.to(torch.int64).unsqueeze(-1)
-    tail_start = (seq_lens // pool_size) * pool_size
-    tail_offsets = torch.arange(pool_size - 1, device=device)
+    if selectable_pools is None:
+        tail_start = (seq_lens // pool_size) * pool_size
+    else:
+        tail_start = selectable_pools.to(torch.int64).unsqueeze(-1) * pool_size
+    tail_offsets = torch.arange(tail_width, device=device)
     tail = torch.where(tail_offsets < seq_lens - tail_start, tail_start + tail_offsets, -1)
 
     return torch.cat((history, tail), dim=-1).to(torch.int32)
+
+
+def shared_pool_prefix(seq_lens: torch.Tensor, query_lens: torch.Tensor, pool_size: int) -> torch.Tensor:
+    """How many leading pools every query row of a request may select from.
+
+    ``npu_lightning_indexer`` takes one key length per request, and its
+    ``sparse_mode=3`` mask moves the boundary by one *key* per query row --
+    which with pooled keys is ``pool_size`` tokens, four times too fast. So the
+    selection runs unmasked over the prefix that is causally valid for the
+    earliest row in the request, and the tail expansion covers the rest.
+
+    Args:
+        seq_lens: ``[num_requests]`` -- tokens known after this step, i.e. the
+            last query row's sequence length.
+        query_lens: ``[num_requests]`` -- query rows contributed this step.
+        pool_size: tokens per pool.
+
+    Returns:
+        ``[num_requests]`` complete pool counts, at least zero.
+    """
+    return ((seq_lens - query_lens + 1).clamp_min(0) // pool_size).to(torch.int32)

@@ -25,6 +25,7 @@ from vllm_ascend.models.glm5next.ops.kpool_compress import (
     expand_pools_and_append_tail,
     fwht128_quant_fp8,
     kpool_compress_k,
+    shared_pool_prefix,
 )
 
 HEAD_DIM = 128
@@ -246,3 +247,69 @@ def test_token_granular_pools_need_no_tail_columns() -> None:
     expanded = expand_pools_and_append_tail(pool_ids, torch.tensor([32]), pool_size=1)
 
     torch.testing.assert_close(expanded, torch.tensor([[5, 9]], dtype=torch.int32))
+
+
+def test_the_shared_prefix_is_what_every_query_row_can_select() -> None:
+    """The earliest row in a request sets the boundary for the whole request."""
+    # One plain decode row, then a four-row draft-verify batch. The verify
+    # batch's earliest row is at seq_len 30, whose complete pools number 7.
+    prefix = shared_pool_prefix(
+        seq_lens=torch.tensor([21, 33]),
+        query_lens=torch.tensor([1, 4]),
+        pool_size=4,
+    )
+    torch.testing.assert_close(prefix, torch.tensor([5, 7], dtype=torch.int32))
+
+
+def test_a_shared_prefix_still_covers_every_recent_token() -> None:
+    """Whatever top-k misses near the end, the tail must name explicitly.
+
+    With a shared boundary the uncovered run is longer than one pool, so this
+    is the property that keeps a draft-verify batch from dropping tokens the
+    rows before it produced.
+    """
+    pool_size, query_len = 4, 4
+    seq_lens = torch.tensor([30, 31, 32, 33])
+    prefix = shared_pool_prefix(seq_lens, torch.full_like(seq_lens, query_len), pool_size)
+    # No pool selected, so the tail is the only thing covering the recent run.
+    pool_ids = torch.full((4, 1), -1, dtype=torch.int32)
+
+    expanded = expand_pools_and_append_tail(
+        pool_ids,
+        seq_lens,
+        pool_size,
+        selectable_pools=prefix,
+        tail_width=pool_size - 1 + query_len - 1,
+    )
+
+    for row in range(4):
+        covered = {int(v) for v in expanded[row] if v >= 0}
+        # Everything from the shared boundary up to this row's own last token.
+        assert covered == set(range(int(prefix[row]) * pool_size, int(seq_lens[row])))
+
+
+@pytest.mark.parametrize("query_len", [1, 2, 4, 5])
+def test_a_shared_prefix_never_names_a_future_token(query_len: int) -> None:
+    generator = torch.Generator().manual_seed(query_len)
+    pool_size = 4
+    rows = 16
+    seq_lens = torch.randint(1, 4096, (rows,), generator=generator, dtype=torch.int32)
+    prefix = shared_pool_prefix(seq_lens, torch.full_like(seq_lens, query_len), pool_size)
+
+    # The operator only ever returns pools inside the key length it was given,
+    # padding the rest, so sample the way it would answer.
+    drawn = torch.randint(0, 1 << 20, (rows, 8), generator=generator, dtype=torch.int64)
+    selectable = prefix.to(torch.int64).unsqueeze(-1)
+    pool_ids = torch.where(selectable > 0, drawn % selectable.clamp_min(1), -1).to(torch.int32)
+
+    expanded = expand_pools_and_append_tail(
+        pool_ids,
+        seq_lens,
+        pool_size,
+        selectable_pools=prefix,
+        tail_width=pool_size - 1 + query_len - 1,
+    )
+
+    # Every id names a token this row has already seen: the selected pools end
+    # at the shared boundary and the tail stops at the row's own length.
+    assert torch.all(expanded < seq_lens.unsqueeze(-1))
