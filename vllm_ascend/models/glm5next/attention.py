@@ -125,28 +125,29 @@ class Glm5NextIndexerCache(DeepseekV32IndexerCache):
         assert isinstance(spec, MLAAttentionSpec)
         spec = replace(spec, tokens_per_state=self._index_kpool)
 
-        # DeepGEMM paged-MQA takes block_kv in {32, 64}; the storage block
-        # (= block_size // index_kpool) is virtually split into pool pages of
-        # the largest such size that tiles it, so it must be a multiple of 32.
+        # One entry per pool, so a block holds block_size // index_kpool of
+        # them -- which is what page_size_bytes is derived from, so the two have
+        # to agree or the cache tensor cannot be viewed at its own page size.
         storage_block_size = spec.block_size // self._index_kpool
-        assert spec.block_size % self._index_kpool == 0 and storage_block_size % 32 == 0, (
-            "Glm5NextIndexerCache: kpool indexer requires cache block_size to "
-            f"be a multiple of index_kpool * 32 ({self._index_kpool * 32}) so "
-            "that DeepGEMM paged-MQA pool pages (32 or 64 entries) tile the "
-            f"storage block, got block_size={spec.block_size} -> "
+
+        # DeepGEMM paged-MQA takes block_kv in {32, 64} and virtually splits the
+        # storage block into pool pages of the largest such size that tiles it.
+        # Ascend scores with npu_lightning_indexer over whole blocks and never
+        # splits them, but the requirement is kept: it is what the checkpoint's
+        # CUDA path needs, and a cache written here has to remain readable
+        # there after a PD transfer.
+        smallest_pool_page = min(PAGED_MQA_PAGE_SIZES)
+        assert spec.block_size % self._index_kpool == 0 and storage_block_size % smallest_pool_page == 0, (
+            "Glm5NextIndexerCache: kpool indexer requires cache block_size to be a "
+            f"multiple of index_kpool * {smallest_pool_page} "
+            f"({self._index_kpool * smallest_pool_page}) so that DeepGEMM paged-MQA "
+            f"pool pages ({' or '.join(str(size) for size in PAGED_MQA_PAGE_SIZES)} "
+            f"entries) tile the storage block, got block_size={spec.block_size} -> "
             f"storage_block_size={storage_block_size}."
         )
-        max_page_size = max(PAGED_MQA_PAGE_SIZES)
-        min_page_size = min(PAGED_MQA_PAGE_SIZES)
-        if storage_block_size <= max_page_size:
-            page_size = storage_block_size
-        elif storage_block_size % max_page_size == 0:
-            page_size = max_page_size
-        else:
-            page_size = min_page_size
         return replace(
             spec,
-            storage_block_size=page_size * self._index_kpool,
+            storage_block_size=storage_block_size,
         )
 
     def get_attn_backend(self):
