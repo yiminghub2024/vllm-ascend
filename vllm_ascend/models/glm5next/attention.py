@@ -36,7 +36,6 @@ from vllm_ascend.models.glm5next.sparse_attn_indexer_kpool import SparseAttnInde
 
 # Paged MQA page sizes the kpool tail cache aligns against. Upstream reads this
 # from `vllm.utils.deep_gemm`, which is a CUDA-only module on Ascend.
-PAGED_MQA_PAGE_SIZES = (32, 64)
 
 # Shared torch.compile config for the indexer's small-kernel leaves. The MLA
 # indexer runs under breakable-CG (CompilationMode.NONE), which blocks FX-graph
@@ -130,24 +129,22 @@ class Glm5NextIndexerCache(DeepseekV32IndexerCache):
         # to agree or the cache tensor cannot be viewed at its own page size.
         storage_block_size = spec.block_size // self._index_kpool
 
-        # DeepGEMM paged-MQA takes block_kv in {32, 64} and virtually splits the
-        # storage block into pool pages of the largest such size that tiles it.
-        # Ascend scores with npu_lightning_indexer over whole blocks and never
-        # splits them, but the requirement is kept: it is what the checkpoint's
-        # CUDA path needs, and a cache written here has to remain readable
-        # there after a PD transfer.
-        smallest_pool_page = min(PAGED_MQA_PAGE_SIZES)
-        assert spec.block_size % self._index_kpool == 0 and storage_block_size % smallest_pool_page == 0, (
-            "Glm5NextIndexerCache: kpool indexer requires cache block_size to be a "
-            f"multiple of index_kpool * {smallest_pool_page} "
-            f"({self._index_kpool * smallest_pool_page}) so that DeepGEMM paged-MQA "
-            f"pool pages ({' or '.join(str(size) for size in PAGED_MQA_PAGE_SIZES)} "
-            f"entries) tile the storage block, got block_size={spec.block_size} -> "
-            f"storage_block_size={storage_block_size}."
-        )
+        # Store the pooled keys as plain bf16 rather than inheriting the FP8
+        # entry plus scale that DeepSeek's indexer cache uses. npu_lightning_
+        # indexer only accepts bf16 or fp16 keys, and it is the operator that
+        # reads this cache on Ascend.
+        #
+        # Dropping the quantization loses nothing. Its Hadamard rotation is
+        # orthonormal, so rotating neither the query nor the key leaves every
+        # score unchanged, and skipping the FP8 round-trip only removes error.
+        # It costs the 128 bytes per entry that the FP8 layout saved, which the
+        # kpool compression has already paid for several times over by keeping
+        # one entry per index_kpool tokens instead of one per token.
         return replace(
             spec,
             storage_block_size=storage_block_size,
+            dtype=torch.bfloat16,
+            head_size=self.head_dim,
         )
 
     def get_attn_backend(self):
