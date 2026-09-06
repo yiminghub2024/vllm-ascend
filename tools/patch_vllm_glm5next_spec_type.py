@@ -17,7 +17,6 @@ Re-run after re-installing or checking out vLLM; it is idempotent. Remove once
 the equivalent fix lands upstream.
 """
 
-import io
 import os
 import sys
 from pathlib import Path
@@ -54,7 +53,7 @@ def main() -> int:
         return 1
 
     path = Path(target.__file__)
-    source = io.open(path, encoding="utf-8").read()
+    source = path.read_text(encoding="utf-8")
 
     if RELAXED_CHECK in source:
         print(f"already patched: {path}")
@@ -74,7 +73,8 @@ def main() -> int:
 
     source = source.replace(EXACT_CHECK, RELAXED_CHECK)
     source = source.replace(ANCHOR, HELPER + ANCHOR, 1)
-    io.open(path, "w", encoding="utf-8", newline="\n").write(source)
+    with path.open("w", encoding="utf-8", newline="\n") as patched:
+        patched.write(source)
     print(f"patched {found} checks in {path}")
     return 0
 
