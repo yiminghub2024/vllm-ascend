@@ -30,6 +30,7 @@ from vllm_ascend.attention.dsa_v41 import (
     pad_sparse_indices,
     scatter_cache_sk,
 )
+from vllm_ascend.core import deepseek_v41 as deepseek_v41_core
 from vllm_ascend.core.deepseek_v41 import (
     DeepseekV41DraftSWASpec,
     DeepseekV41FullSpec,
@@ -44,8 +45,10 @@ from vllm_ascend.core.deepseek_v41 import (
     request_blocks,
     reshape_cache,
 )
+from vllm_ascend.device.hardware_profile import get_hardware_profile
 from vllm_ascend.models.deepseek_v41.compressor import DeepseekV41Compressor
 from vllm_ascend.models.deepseek_v41.model import build_layer_plan
+from vllm_ascend.utils import AscendDeviceType
 from vllm_ascend.worker.device_metadata import DeviceMetadataStage
 
 
@@ -57,6 +60,22 @@ def mock_npu_rms_norm(monkeypatch):
         return (x.float() * rstd).to(x.dtype) * gamma, rstd
 
     monkeypatch.setattr(torch_npu, "npu_rms_norm", rms_norm)
+
+
+@pytest.fixture
+def on_a3(monkeypatch):
+    """Pin the payload-sized slot pages regardless of the installed SoC.
+
+    Slot pages are only rounded up to a row multiple where
+    ``scatter_nd_update_sk`` is missing, so byte-exact layout assertions have
+    to name the hardware they describe instead of inheriting it from the
+    package's build info.
+    """
+    monkeypatch.setattr(
+        deepseek_v41_core,
+        "get_current_hardware_profile",
+        lambda: get_hardware_profile(AscendDeviceType.A3),
+    )
 
 
 @pytest.fixture
@@ -171,6 +190,7 @@ def test_twelve_groups_share_four_layer_slots(config, runtime):
                 assert scale.shape == (blocks, spec.storage_block_size, 1, 1)
 
 
+@pytest.mark.usefixtures("on_a3")
 def test_production_layout_matches_design(config, runtime):
     runtime.cache_config.block_size = 128
     specs = build_v41_cache_specs(dict(config, head_dim=512, index_head_dim=128), runtime)
@@ -194,6 +214,37 @@ def test_production_layout_matches_design(config, runtime):
     cache_config = KVCacheConfig(num_blocks=blocks, kv_cache_tensors=tensors, kv_cache_groups=groups)
     _, caches = allocate_cache_views(cache_config)
     assert sum(caches[n].is_contiguous() for n, s in padded.items() if isinstance(s, DeepseekV41SWASpec)) == 30
+
+
+def test_production_layout_rounds_slot_pages_up_without_scatter_sk(config, runtime, monkeypatch):
+    # Without scatter_nd_update_sk the store addresses each plane through a
+    # contiguous view of the slot, which needs every page to be a whole number
+    # of rows. Only the C1 slot is short: 147712 leaves 256 bytes over a
+    # 1024-byte MLA row.
+    monkeypatch.setattr(
+        deepseek_v41_core,
+        "get_current_hardware_profile",
+        lambda: get_hardware_profile(AscendDeviceType.A5),
+    )
+    runtime.cache_config.block_size = 128
+    specs = build_v41_cache_specs(dict(config, head_dim=512, index_head_dim=128), runtime)
+    groups = make_cache_groups(group_cache_specs(specs))
+    slots = cache_slots_from_groups(groups)
+    assert [slot.page_size_bytes for slot in slots] == [131072] * 3 + [148480]
+    assert pool_bytes_per_block(groups) == 541696
+    padded = {n: s for g in groups for n, s in g.kv_cache_spec.kv_cache_specs.items()}
+    swa_padding = [
+        s.page_size_bytes - s.real_page_size_bytes for s in padded.values() if isinstance(s, DeepseekV41SWASpec)
+    ]
+    assert swa_padding.count(0) == 30 and swa_padding.count(17408) == 10
+    blocks, tensors = allocate_cache_config(runtime, groups, 541696 * 3)
+    cache_config = KVCacheConfig(num_blocks=blocks, kv_cache_tensors=tensors, kv_cache_groups=groups)
+    _, caches = allocate_cache_views(cache_config)
+    for name, spec in padded.items():
+        cache = caches[name]
+        for view in cache if isinstance(cache, tuple) else (cache,):
+            row_elements = view.shape[-2] * view.shape[-1]
+            assert view.stride(0) % row_elements == 0, f"{name} page is not a row multiple"
 
 
 def test_shared_slots_isolate_groups_and_recycled_ids(config, runtime):
@@ -385,6 +436,7 @@ def test_dspark_rejects_verification_tail_that_cannot_fit_ring(runtime, count):
         validate_cache_runtime(runtime)
 
 
+@pytest.mark.usefixtures("on_a3")
 def test_dspark_is_one_additional_group_in_existing_slots(runtime):
     runtime.model_config.max_model_len = 4096
     runtime.max_in_flight_tokens = 256

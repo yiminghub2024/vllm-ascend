@@ -33,8 +33,8 @@ from vllm_ascend.core.deepseek_v41 import (
     DeepseekV41FullSpec,
     DeepseekV41IndexerSpec,
     DeepseekV41SWASpec,
+    builds_scatter_nd_update_sk,
 )
-from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 from vllm_ascend.ops.rope_dsv4 import (
     get_cos_and_sin_dsa,
     get_full_cos_and_sin_dsa_for_layer,
@@ -206,15 +206,30 @@ def _request_counts(common: Any, num_reqs: int):
     return num_decodes, num_decode_tokens, num_prefills, num_prefill_tokens
 
 
-def builds_scatter_nd_update_sk() -> bool:
-    """Return whether this SoC's custom-op package contains ``scatter_nd_update_sk``.
+def flat_row_store(cache: torch.Tensor, indices: torch.Tensor, updates: torch.Tensor) -> None:
+    """Store rows through a contiguous view of the whole slot backing.
 
-    ``csrc/build_aclnn.sh`` builds that op for ascend910b and ascend910_93 only,
-    because ``csrc/moe/scatter_nd_update_sk/op_kernel`` ships an arch22 kernel
-    and no arch35 one. ``DSV4_COMPRESSED_CACHE`` is declared for the 950 family
-    alone, so its absence selects exactly the SoCs that do build the op.
+    ``cache`` is a per-page strided view: page ``b`` begins ``b *
+    cache.stride(0)`` elements into the plane and row ``r`` of that page a
+    further ``r * width``. ``plan_cache_slots`` aligns the slot page so that
+    stride is a whole number of rows wherever this path is used, which makes
+    ``[block, offset]`` equivalent to the single row ``block * rows_per_page +
+    offset`` of one contiguous tensor over the same storage. The view stops at
+    the last page's payload so a plane sitting at a non-zero page offset cannot
+    run past the end of the backing.
     """
-    return not get_current_hardware_profile().supports(HardwareCapability.DSV4_COMPRESSED_CACHE)
+    num_pages, payload_rows, width = cache.shape
+    page_stride = cache.stride(0)
+    if cache.stride(1) != width or cache.stride(2) != 1 or page_stride % width:
+        raise NotImplementedError(
+            "V4.1 cannot flatten this cache plane for the dense store: "
+            f"stride {cache.stride()} is not a row multiple of width {width}."
+        )
+    rows_per_page = page_stride // width
+    flat = cache.as_strided(((num_pages - 1) * rows_per_page + payload_rows, width), (width, 1))
+    blocks, offsets = indices[:, 0], indices[:, 1]
+    rows = torch.where(blocks >= 0, blocks * rows_per_page + offsets, torch.full_like(blocks, -1))
+    torch_npu.npu_scatter_nd_update_(flat, rows.unsqueeze(-1).to(torch.int64).contiguous(), updates)
 
 
 def scatter_cache_sk(
@@ -229,11 +244,10 @@ def scatter_cache_sk(
     the plane shape. ``npu_scatter_nd_update_sk`` preserves that stride and
     treats the builder's ``[-1, -1]`` coordinates as skipped rows, matching V4.
 
-    The dense ``npu_scatter_nd_update_`` that V4's A5 BF16 plan uses also skips
-    ``[-1, -1]`` rows, but it addresses the destination through the shape it is
-    given, so it can only stand in for a plane whose page stride already equals
-    its payload. ``plan_cache_slots`` pads most planes up to a shared slot page,
-    so refuse the substitution rather than write to the wrong pages.
+    Where that op is not built, ``flat_row_store`` reaches the same addresses
+    through one contiguous view of the slot backing, which the dense
+    ``npu_scatter_nd_update_`` can address. Both paths skip the builder's
+    ``[-1, -1]`` rows, so ACLGraph still sees a fixed ``[T, 2]`` shape.
     """
     if slot_mapping.ndim != 2 or slot_mapping.shape[-1] != 2:
         raise ValueError(
@@ -245,14 +259,7 @@ def scatter_cache_sk(
     if builds_scatter_nd_update_sk():
         torch.ops._C_ascend.npu_scatter_nd_update_sk(cache, indices, updates)
         return
-    if not cache.is_contiguous():
-        raise NotImplementedError(
-            "V4.1 cannot store into a padded cache plane on this SoC: "
-            "scatter_nd_update_sk has no arch35 kernel and the dense "
-            "npu_scatter_nd_update_ ignores the slot page stride "
-            f"{cache.stride()} implied by shape {tuple(cache.shape)}."
-        )
-    torch_npu.npu_scatter_nd_update_(cache, indices.to(torch.int64).contiguous(), updates)
+    flat_row_store(cache, indices, updates)
 
 
 def pad_sparse_indices(indices: torch.Tensor, topk: int) -> torch.Tensor:

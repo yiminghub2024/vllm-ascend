@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Framework-side V4.1 cache specs and layer-outermost hybrid allocation."""
 
+import math
 from dataclasses import dataclass, replace
 
 import torch
@@ -11,8 +12,20 @@ from vllm.v1.kv_cache_interface import KVCacheGroupSpec, KVCacheTensor, UniformT
 
 from vllm_ascend.core.circular_buffer import AscendCircularBufferSpec
 from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec, AscendSlidingWindowMLASpec
+from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 
 STATE_RING_ROWS = 32
+
+
+def builds_scatter_nd_update_sk() -> bool:
+    """Return whether this SoC's custom-op package contains ``scatter_nd_update_sk``.
+
+    ``csrc/build_aclnn.sh`` builds that op for ascend910b and ascend910_93 only,
+    because ``csrc/moe/scatter_nd_update_sk/op_kernel`` ships an arch22 kernel
+    and no arch35 one. ``DSV4_COMPRESSED_CACHE`` is declared for the 950 family
+    alone, so its absence selects exactly the SoCs that do build the op.
+    """
+    return not get_current_hardware_profile().supports(HardwareCapability.DSV4_COMPRESSED_CACHE)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -127,6 +140,29 @@ def _cache_plane_sizes(spec):
     return (key_bytes,)
 
 
+def _cache_plane_row_bytes(spec):
+    key_bytes = spec.num_kv_heads * spec.head_size * spec.dtype.itemsize
+    if isinstance(spec, DeepseekV41IndexerSpec):
+        return key_bytes, spec.num_kv_heads * spec.scale_dim * spec.scale_dtype.itemsize
+    return (key_bytes,)
+
+
+def _flat_row_page_size(capacity, slot_specs):
+    """Round a slot page up until every plane's rows tile it without drift.
+
+    Where ``scatter_nd_update_sk`` is unavailable the store addresses a plane
+    through a contiguous ``[rows, width]`` view of the slot backing. That view
+    only coincides with the strided per-page view when consecutive pages start
+    on a row boundary for every plane sharing the slot, which needs the page to
+    be a common multiple of their row sizes.
+    """
+    alignment = 1
+    for spec in slot_specs:
+        for row_bytes in _cache_plane_row_bytes(spec):
+            alignment = math.lcm(alignment, row_bytes)
+    return -(-capacity // alignment) * alignment
+
+
 def _draft_layer_number(name):
     try:
         return int(("." + name).rsplit(".mtp.", 1)[1].split(".", 1)[0])
@@ -177,6 +213,16 @@ def plan_cache_slots(specs):
         kv_bytes = sum(_cache_plane_sizes(kv_spec))
         index_bytes = sum(_cache_plane_sizes(index_spec))
         capacity = max(kv_bytes + index_bytes, *(sum(_cache_plane_sizes(specs[n])) for n in aliases))
+        if not builds_scatter_nd_update_sk():
+            # A DSpark draft plane shares its target SWA geometry, so it never
+            # widens the alignment and can stay out of this set.
+            aligned = _flat_row_page_size(capacity, [kv_spec, index_spec, *(specs[n] for n in aliases)])
+            if aligned != capacity and any(isinstance(specs[n], DeepseekV41CompressorStateSpec) for n in aliases):
+                raise ValueError(
+                    f"V4.1 slot {slot_idx} carries the compressor ring, which must fill its page exactly, "
+                    f"so its {capacity}-byte page cannot be aligned up to {aligned} for the dense store"
+                )
+            capacity = aligned
         if slot_idx < len(draft):
             draft_name = draft[slot_idx]
             draft_spec = specs[draft_name]
