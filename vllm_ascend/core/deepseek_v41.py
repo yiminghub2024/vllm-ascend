@@ -394,9 +394,12 @@ def validate_cache_runtime(vllm_config):
         raise NotImplementedError("V4.1 initial runtime requires PP=DCP=PCP=1")
     if vllm_config.scheduler_config.disable_hybrid_kv_cache_manager:
         raise ValueError("V4.1 requires the hybrid KV cache manager")
-    if vllm_config.cache_config.cache_dtype not in ("auto", "bfloat16"):
-        raise NotImplementedError("V4.1 initial cache layout requires BF16")
-    if speculative is not None:
-        # Aurora's planes are always BF16. Pin the inherited DSV4 draft
-        # backend to the same layout, including on hardware where auto is FP8.
-        vllm_config.cache_config.cache_dtype = "bfloat16"
+    cache_dtype = vllm_config.cache_config.cache_dtype
+    if cache_dtype not in ("auto", "bfloat16"):
+        raise NotImplementedError(f"V4.1 cache planes are BF16; a {cache_dtype!r} KV cache is not implemented")
+    # Aurora's planes are always BF16, but the inherited DSV4 modules take the
+    # SWA plane's dtype from cache_dtype through get_dsv4_attn_kv_dtype(),
+    # which reads auto as FP8 wherever the compressed cache exists. Resolve
+    # auto here, which DeepseekV41Attention reaches before super().__init__(),
+    # so no hardware builds an FP8 SWA plane behind a BF16 long-KV plane.
+    vllm_config.cache_config.cache_dtype = "bfloat16"
