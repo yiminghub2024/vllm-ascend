@@ -13,6 +13,7 @@ from typing import Any
 
 import torch
 import torch.nn.functional as F
+import torch_npu
 from torch import nn
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import VllmConfig
@@ -33,6 +34,7 @@ from vllm_ascend.core.deepseek_v41 import (
     DeepseekV41IndexerSpec,
     DeepseekV41SWASpec,
 )
+from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 from vllm_ascend.ops.rope_dsv4 import (
     get_cos_and_sin_dsa,
     get_full_cos_and_sin_dsa_for_layer,
@@ -204,6 +206,17 @@ def _request_counts(common: Any, num_reqs: int):
     return num_decodes, num_decode_tokens, num_prefills, num_prefill_tokens
 
 
+def builds_scatter_nd_update_sk() -> bool:
+    """Return whether this SoC's custom-op package contains ``scatter_nd_update_sk``.
+
+    ``csrc/build_aclnn.sh`` builds that op for ascend910b and ascend910_93 only,
+    because ``csrc/moe/scatter_nd_update_sk/op_kernel`` ships an arch22 kernel
+    and no arch35 one. ``DSV4_COMPRESSED_CACHE`` is declared for the 950 family
+    alone, so its absence selects exactly the SoCs that do build the op.
+    """
+    return not get_current_hardware_profile().supports(HardwareCapability.DSV4_COMPRESSED_CACHE)
+
+
 def scatter_cache_sk(
     cache: torch.Tensor,
     slot_mapping: torch.Tensor,
@@ -215,6 +228,12 @@ def scatter_cache_sk(
     physical page stride is not necessarily the contiguous stride implied by
     the plane shape. ``npu_scatter_nd_update_sk`` preserves that stride and
     treats the builder's ``[-1, -1]`` coordinates as skipped rows, matching V4.
+
+    The dense ``npu_scatter_nd_update_`` that V4's A5 BF16 plan uses also skips
+    ``[-1, -1]`` rows, but it addresses the destination through the shape it is
+    given, so it can only stand in for a plane whose page stride already equals
+    its payload. ``plan_cache_slots`` pads most planes up to a shared slot page,
+    so refuse the substitution rather than write to the wrong pages.
     """
     if slot_mapping.ndim != 2 or slot_mapping.shape[-1] != 2:
         raise ValueError(
@@ -223,7 +242,17 @@ def scatter_cache_sk(
     cache = cache.squeeze(-2)
     indices = slot_mapping[: values.shape[0]]
     updates = values.to(cache.dtype).contiguous()
-    torch.ops._C_ascend.npu_scatter_nd_update_sk(cache, indices, updates)
+    if builds_scatter_nd_update_sk():
+        torch.ops._C_ascend.npu_scatter_nd_update_sk(cache, indices, updates)
+        return
+    if not cache.is_contiguous():
+        raise NotImplementedError(
+            "V4.1 cannot store into a padded cache plane on this SoC: "
+            "scatter_nd_update_sk has no arch35 kernel and the dense "
+            "npu_scatter_nd_update_ ignores the slot page stride "
+            f"{cache.stride()} implied by shape {tuple(cache.shape)}."
+        )
+    torch_npu.npu_scatter_nd_update_(cache, indices.to(torch.int64).contiguous(), updates)
 
 
 def pad_sparse_indices(indices: torch.Tensor, topk: int) -> torch.Tensor:
@@ -505,10 +534,10 @@ class DeepseekV41EagerAttentionImpl:
         if attn.head_dim != 512:
             raise ValueError(f"SparseFlashMla requires head_dim 512, got {attn.head_dim}")
         if attn.window_size != 128:
-            raise ValueError(f"A2/A3 SparseFlashMla requires sliding_window 128, got {attn.window_size}")
+            raise ValueError(f"SparseFlashMla requires sliding_window 128, got {attn.window_size}")
         if not 1 <= attn.n_local_heads <= 128 or attn.n_local_heads & (attn.n_local_heads - 1):
             raise ValueError(
-                "A2/A3 SparseFlashMla requires the local query-head count to be "
+                "SparseFlashMla requires the local query-head count to be "
                 f"a power of two in [1, 128], got {attn.n_local_heads}"
             )
         has_compressed = self.role.compress_ratio in (1, 2)

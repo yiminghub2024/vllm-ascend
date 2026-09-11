@@ -217,6 +217,14 @@ elif [[ "$SOC_VERSION" =~ ^ascend950 ]]; then
         "vllm_quant_lightning_indexer_metadata"
         "kv_quant_sparse_attn_sharedkv"
         "kv_quant_sparse_attn_sharedkv_metadata"
+        # DeepSeek V4.1 selects candidate blocks and attends over the
+        # compressed stream with these two ops. Both already ship an arch35
+        # kernel, and both metadata AICPU kernels resolve ValidSocVersion
+        # ASCEND950, so 950 only needed the build entries.
+        "quant_lightning_indexer_v2"
+        "quant_lightning_indexer_v2_metadata"
+        "sparse_flash_mla"
+        "sparse_flash_mla_metadata"
         "hc_post"
         "hc_pre"
         "swiglu_group_quant"

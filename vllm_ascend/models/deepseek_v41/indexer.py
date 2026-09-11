@@ -180,16 +180,16 @@ class DeepseekV41Indexer(nn.Module):
         if uses_candidate_filter and candidates is None:
             raise RuntimeError("V4.1 candidate-filtering indexer ran before its source")
         if self.width != 128 or self.n_heads not in (32, 64):
-            raise ValueError("A3 QLI requires index_head_dim=128 and 32 or 64 index heads")
+            raise ValueError("QLI requires index_head_dim=128 and 32 or 64 index heads")
         if not 1 <= self.index_topk <= 2048:
-            raise ValueError("A3 QLI requires index_topk in [1, 2048]")
+            raise ValueError("QLI requires index_topk in [1, 2048]")
         if self.compress_ratio not in (1, 2):
             raise ValueError("Aurora QLI supports compression ratios 1 and 2")
         if is_candidate_source or uses_candidate_filter:
             if not 0 < candidate_topk_blocks <= 2048 or candidate_topk_blocks % 64:
                 raise ValueError("candidate_topk_blocks must be a multiple of 64 in [64, 2048]")
             if candidate_block_size != 8:
-                raise ValueError("The current A3 candidate kernel requires candidate_block_size=8")
+                raise ValueError("The candidate kernel requires candidate_block_size=8")
         candidate_shape = (query.shape[0], 1, candidate_topk_blocks)
         if uses_candidate_filter and (candidates.shape != candidate_shape or candidates.dtype != torch.int32):
             raise ValueError("Candidate consumer requires INT32 block IDs with matching query rows")
