@@ -376,6 +376,27 @@ def test_dspark_runtime_preserves_ring_retention_limit(runtime, mode, count):
     assert runtime.cache_config.cache_dtype == "bfloat16"
 
 
+@pytest.mark.parametrize("launched_as", ["auto", "bfloat16"])
+def test_cache_dtype_resolves_to_bf16_without_speculation(runtime, launched_as):
+    # The inherited DSV4 SWA plane takes its dtype from cache_dtype, and auto
+    # means FP8 where the compressed cache exists, so auto has to be resolved
+    # here rather than only on the DSpark path.
+    from vllm_ascend.core.deepseek_v41 import validate_cache_runtime
+
+    runtime.cache_config.cache_dtype = launched_as
+    validate_cache_runtime(runtime)
+    assert runtime.cache_config.cache_dtype == "bfloat16"
+
+
+@pytest.mark.parametrize("launched_as", ["fp8", "fp8_e4m3", "float8_e4m3fn", "float16"])
+def test_cache_dtype_rejects_layouts_the_planes_cannot_hold(runtime, launched_as):
+    from vllm_ascend.core.deepseek_v41 import validate_cache_runtime
+
+    runtime.cache_config.cache_dtype = launched_as
+    with pytest.raises(NotImplementedError, match="BF16"):
+        validate_cache_runtime(runtime)
+
+
 @pytest.mark.parametrize("count", [0, 32, 63])
 def test_dspark_rejects_verification_tail_that_cannot_fit_ring(runtime, count):
     from vllm_ascend.core.deepseek_v41 import validate_cache_runtime
