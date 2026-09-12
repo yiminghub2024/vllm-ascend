@@ -47,7 +47,9 @@ def kernel_warmup(worker: NPUWorker) -> None:
     _run_warmup("rejection_sampler", rejection_sampler_triton_warmup, worker)
     _run_warmup("penalties", penalties_triton_warmup, worker)
     _run_warmup("rms", triton_rms_warmup, worker)
-    _run_warmup("deepseek_v41_indexer", deepseek_v41_triton_warmup, worker)
+    # Indexer and C2 ring tiles must be compiled before capture_model: V4.1's
+    # FULL_DECODE_ONLY graph replays those kernels at the capture sizes.
+    _run_warmup("deepseek_v41", deepseek_v41_triton_warmup, worker)
 
     elapsed = time.perf_counter() - start
     logger.info("Triton kernel warmup finished in %.3fs.", elapsed)

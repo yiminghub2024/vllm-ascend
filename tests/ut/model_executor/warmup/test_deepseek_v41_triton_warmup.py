@@ -25,26 +25,47 @@ def test_collect_indexer_warmup_token_counts(topk, cores, max_tokens, expected):
     assert warmup.collect_indexer_warmup_token_counts(topk, cores, max_tokens) == expected
 
 
-@pytest.mark.parametrize("model_type", ["deepseek_v4.1", "deepseek_v41", "deepseek_v4.1_text", "deepseek_v41_text"])
-def test_warmup_covers_tiles_and_active_compression_ratios(monkeypatch, model_type):
+@pytest.mark.parametrize(
+    "max_tokens,capture,expected",
+    [
+        (8, (), [1, 2, 4, 8]),
+        (32, (3, 16), [1, 2, 3, 4, 8, 16, 32]),
+        (256, (64,), [1, 2, 4, 8, 16, 32, 64, 128]),
+        (1, (8,), [1]),
+    ],
+)
+def test_collect_compressor_warmup_token_counts(max_tokens, capture, expected):
+    assert warmup.collect_compressor_warmup_token_counts(max_tokens, capture) == expected
+
+
+def _v41_worker(model_type, ratios, *, max_tokens=4096, head_dim=128, capture_sizes=()):
     config = SimpleNamespace(
         model_type=model_type,
         num_hidden_layers=4,
-        compress_ratios=[0, 1, 2, 2, 8],
+        compress_ratios=ratios,
         index_n_heads=64,
         index_head_dim=128,
         index_topk=2048,
+        head_dim=head_dim,
     )
-    worker = SimpleNamespace(
+    return SimpleNamespace(
         model_config=SimpleNamespace(hf_text_config=config, dtype=torch.bfloat16),
-        scheduler_config=SimpleNamespace(max_num_batched_tokens=4096),
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=max_tokens),
+        vllm_config=SimpleNamespace(compilation_config=SimpleNamespace(cudagraph_capture_sizes=capture_sizes)),
         device=torch.device("cpu"),
     )
-    quantize, prepare = Mock(), Mock()
+
+
+@pytest.mark.parametrize("model_type", ["deepseek_v4.1", "deepseek_v41", "deepseek_v4.1_text", "deepseek_v41_text"])
+def test_warmup_covers_tiles_and_active_compression_ratios(monkeypatch, model_type):
+    worker = _v41_worker(model_type, [0, 1, 2, 2, 8])
+    quantize, prepare, compress = Mock(), Mock(), Mock()
     monkeypatch.setattr(warmup, "HAS_TRITON", True)
     monkeypatch.setattr(warmup, "get_vectorcore_num", lambda: 40)
+    monkeypatch.setattr(warmup, "_cube_core_num", lambda: 8)
     monkeypatch.setattr(warmup, "quantize_indexer_query", quantize)
     monkeypatch.setattr(warmup, "prepare_indexer_indices", prepare)
+    monkeypatch.setattr(warmup, "compressor_from_projected", compress)
     warmup.deepseek_v41_triton_warmup(worker)
     query = quantize.call_args.args[0]
     assert query.shape == (1, 64, 128)
@@ -56,6 +77,26 @@ def test_warmup_covers_tiles_and_active_compression_ratios(monkeypatch, model_ty
         (41, 2),
     ]
     assert all(call.args[1].dtype == torch.int64 for call in prepare.call_args_list)
+    assert [call.kwargs["max_query_len"] for call in compress.call_args_list] == [1, 2, 4, 8, 16, 32, 128]
+    assert all(call.kwargs["num_cores"] == 8 for call in compress.call_args_list)
+    kv, scores, state, metadata, out = compress.call_args.args[:5]
+    assert kv.dtype == torch.float32 and scores.shape == kv.shape
+    assert state.shape == (1, 32, 256)
+    assert metadata.shape == (5, 1) and metadata.dtype == torch.int32
+    assert out.dtype == torch.bfloat16
+
+
+def test_compressor_warmup_includes_graph_capture_sizes(monkeypatch):
+    worker = _v41_worker("deepseek_v41", [2], max_tokens=64, capture_sizes=(3, 24))
+    compress = Mock()
+    monkeypatch.setattr(warmup, "HAS_TRITON", True)
+    monkeypatch.setattr(warmup, "_cube_core_num", lambda: 4)
+    monkeypatch.setattr(warmup, "quantize_indexer_query", Mock())
+    monkeypatch.setattr(warmup, "prepare_indexer_indices", Mock())
+    monkeypatch.setattr(warmup, "get_vectorcore_num", lambda: 40)
+    monkeypatch.setattr(warmup, "compressor_from_projected", compress)
+    warmup.deepseek_v41_triton_warmup(worker)
+    assert [call.kwargs["max_query_len"] for call in compress.call_args_list] == [1, 2, 3, 4, 8, 16, 24, 32]
 
 
 @pytest.mark.parametrize(
@@ -67,10 +108,36 @@ def test_warmup_skips_unused_indexer(monkeypatch, has_triton, model_type, ratios
             hf_text_config=SimpleNamespace(model_type=model_type, num_hidden_layers=1, compress_ratios=ratios)
         )
     )
-    quantize, prepare = Mock(), Mock()
+    quantize, prepare, compress = Mock(), Mock(), Mock()
     monkeypatch.setattr(warmup, "HAS_TRITON", has_triton)
     monkeypatch.setattr(warmup, "quantize_indexer_query", quantize)
     monkeypatch.setattr(warmup, "prepare_indexer_indices", prepare)
+    monkeypatch.setattr(warmup, "compressor_from_projected", compress)
     warmup.deepseek_v41_triton_warmup(worker)
     quantize.assert_not_called()
     prepare.assert_not_called()
+    compress.assert_not_called()
+
+
+def test_compressor_warmup_skips_when_ratio_two_is_absent(monkeypatch):
+    worker = _v41_worker("deepseek_v41", [0, 1, 1])
+    compress = Mock()
+    monkeypatch.setattr(warmup, "HAS_TRITON", True)
+    monkeypatch.setattr(warmup, "get_vectorcore_num", lambda: 40)
+    monkeypatch.setattr(warmup, "quantize_indexer_query", Mock())
+    monkeypatch.setattr(warmup, "prepare_indexer_indices", Mock())
+    monkeypatch.setattr(warmup, "compressor_from_projected", compress)
+    warmup.deepseek_v41_triton_warmup(worker)
+    compress.assert_not_called()
+
+
+def test_compressor_warmup_skips_non_power_of_two_head_dim(monkeypatch):
+    worker = _v41_worker("deepseek_v41", [2], head_dim=384)
+    compress = Mock()
+    monkeypatch.setattr(warmup, "HAS_TRITON", True)
+    monkeypatch.setattr(warmup, "get_vectorcore_num", lambda: 40)
+    monkeypatch.setattr(warmup, "quantize_indexer_query", Mock())
+    monkeypatch.setattr(warmup, "prepare_indexer_indices", Mock())
+    monkeypatch.setattr(warmup, "compressor_from_projected", compress)
+    warmup.deepseek_v41_triton_warmup(worker)
+    compress.assert_not_called()
