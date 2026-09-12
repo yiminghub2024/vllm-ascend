@@ -9,6 +9,8 @@ import pytest
 import torch
 
 from vllm_ascend.attention import dsa_v41
+from vllm_ascend.device.hardware_profile import get_hardware_profile
+from vllm_ascend.utils import AscendDeviceType
 
 
 def test_dsa_v41_custom_op_forwards_its_output_buffer(monkeypatch):
@@ -152,7 +154,7 @@ def test_preprocess_equivalence_and_stream_dependencies(monkeypatch, share_quant
 
 
 @pytest.mark.parametrize("enabled", [False, True])
-def test_forward_selects_preprocess_from_v1_switch(monkeypatch, enabled):
+def test_forward_selects_preprocess_from_overlap_config(monkeypatch, enabled):
     impl = object.__new__(dsa_v41.DeepseekV41EagerAttentionImpl)
     impl.role = SimpleNamespace(is_kv_source=False)
     hidden = torch.zeros(1, 8)
@@ -163,8 +165,9 @@ def test_forward_selects_preprocess_from_v1_switch(monkeypatch, enabled):
     impl.multistream_preprocess = Mock(return_value=(q, qr))
     impl._select_sparse_indices = Mock(return_value=None)
     impl._attention = Mock(return_value=q)
+    # DSV4 disables overlap on A5 BF16 SparseFlashMla; V4.1 must ignore that.
     v1_impl = SimpleNamespace(
-        multistream_dsv4_dsa_overlap=enabled,
+        multistream_dsv4_dsa_overlap=False,
         _forward_o_proj=lambda q, output: output.zero_(),
     )
     attn = SimpleNamespace(
@@ -175,6 +178,7 @@ def test_forward_selects_preprocess_from_v1_switch(monkeypatch, enabled):
     )
     metadata.rope = lambda *args: (torch.zeros(1), torch.zeros(1))
     monkeypatch.setattr(dsa_v41, "get_forward_context", lambda: SimpleNamespace(attn_metadata={}))
+    monkeypatch.setattr(dsa_v41, "v41_multistream_preprocess_enabled", lambda: enabled)
     monkeypatch.setattr(torch.ops._C_ascend, "inplace_partial_rotary_mul", lambda *args, **kwargs: None, raising=False)
     output = torch.full_like(hidden, 1)
     result = impl.forward(attn, None, hidden, output)
@@ -184,3 +188,19 @@ def test_forward_selects_preprocess_from_v1_switch(monkeypatch, enabled):
     unused.assert_not_called()
     assert result is output
     assert torch.count_nonzero(output) == 0
+
+
+@pytest.mark.parametrize("device_type", [AscendDeviceType.A3, AscendDeviceType.A5])
+@pytest.mark.parametrize("enabled", [False, True])
+def test_v41_overlap_follows_config_on_every_soc(monkeypatch, device_type, enabled):
+    # Byte-layout tests pin SoC because pages differ; this switch must not.
+    monkeypatch.setattr(
+        "vllm_ascend.core.deepseek_v41.get_current_hardware_profile",
+        lambda: get_hardware_profile(device_type),
+    )
+    monkeypatch.setattr(
+        dsa_v41,
+        "get_ascend_config",
+        lambda: SimpleNamespace(multistream_dsv4_dsa_overlap=enabled),
+    )
+    assert dsa_v41.v41_multistream_preprocess_enabled() is enabled

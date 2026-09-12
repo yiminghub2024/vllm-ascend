@@ -4,7 +4,16 @@
 import torch
 import torch_npu
 
-from vllm_ascend.quantization.methods import AscendW8A8DynamicLinearMethod
+from vllm_ascend.quantization.methods import (
+    AscendW8A8DynamicLinearMethod,
+    AscendW8A8MXFP8DynamicLinearMethod,
+)
+
+
+def _inner_quant_scheme(quant_method):
+    """Return the concrete scheme, unwrapping AscendLinearMethod if needed."""
+    inner = getattr(quant_method, "quant_method", quant_method)
+    return inner if inner is not None else quant_method
 
 
 class CVLinearWrapper:
@@ -12,7 +21,9 @@ class CVLinearWrapper:
     Splits a Linear layer into quantize(Vector) + matmul(Cube).
 
     Automatically detects TP communication operations:
-    - No communication (ReplicatedLinear): W8A8 is split into independent quantize + matmul
+    - No communication (ReplicatedLinear): W8A8 / MXFP8 is split into independent
+      quantize + matmul. MXFP8 uses ``npu_dynamic_mx_quant``, the same Vector op
+      A5 MLAPO uses before ``npu_mla_prolog_v3``.
     - Has communication (ColumnParallelLinear with custom_op): automatically falls back to full forward
 
     Usage example:
@@ -33,21 +44,23 @@ class CVLinearWrapper:
 
         # Detect quantization scheme
         # Handles two cases:
-        # 1. linear.quant_method is directly AscendW8A8DynamicLinearMethod
+        # 1. linear.quant_method is directly the scheme
         # 2. linear.quant_method is a wrapper class, requiring .quant_method to get the actual quantization method
         self._quant_method = linear.quant_method
-        self._is_w8a8_dynamic = self._detect_w8a8_dynamic(linear.quant_method)
+        scheme = _inner_quant_scheme(linear.quant_method)
+        self._is_w8a8_dynamic = isinstance(scheme, AscendW8A8DynamicLinearMethod)
+        self._is_mxfp8 = isinstance(scheme, AscendW8A8MXFP8DynamicLinearMethod)
+        self._mxfp8_method = scheme if self._is_mxfp8 else None
 
     @staticmethod
     def _detect_w8a8_dynamic(quant_method):
         """Detect whether the quantization method is W8A8 Dynamic"""
-        # Case 1: quant_method is directly AscendW8A8DynamicLinearMethod
-        if isinstance(quant_method, AscendW8A8DynamicLinearMethod):
-            return True
-        # Case 2: quant_method is a wrapper class, requiring .quant_method to get the actual method
-        return hasattr(quant_method, "quant_method") and isinstance(
-            quant_method.quant_method, AscendW8A8DynamicLinearMethod
-        )
+        return isinstance(_inner_quant_scheme(quant_method), AscendW8A8DynamicLinearMethod)
+
+    @staticmethod
+    def _detect_mxfp8(quant_method):
+        """Detect W8A8-MXFP8, including DeepSeek's 128x128 ds_linear subclass."""
+        return isinstance(_inner_quant_scheme(quant_method), AscendW8A8MXFP8DynamicLinearMethod)
 
     @staticmethod
     def _detect_communication(linear):
@@ -84,11 +97,24 @@ class CVLinearWrapper:
         if self._has_communication:
             return x, None
 
+        if self._is_mxfp8:
+            original_shape = x.shape
+            if x.dim() > 2:
+                x = x.view(-1, x.shape[-1])
+            quantized_x, pertoken_scale = torch_npu.npu_dynamic_mx_quant(
+                x,
+                dst_type=torch.float8_e4m3fn,
+                scale_alg=self._mxfp8_method.dynamic_mx_quant_scale_alg,
+            )
+            if len(original_shape) > 2:
+                quantized_x = quantized_x.view(*original_shape[:-1], -1)
+                pertoken_scale = pertoken_scale.view(*original_shape[:-1], -1)
+            return quantized_x, pertoken_scale
+
         if self._is_w8a8_dynamic:
             quantized_x, pertoken_scale = torch_npu.npu_dynamic_quant(x)
             return quantized_x, pertoken_scale
-        else:
-            return x, None
+        return x, None
 
     def matmul(self, quantized_x: torch.Tensor, pertoken_scale=None, bias=None):
         """
@@ -96,7 +122,7 @@ class CVLinearWrapper:
 
         Args:
             quantized_x: Quantized input (original input when communication is present)
-            pertoken_scale: Per-token scaling factor for W8A8_DYNAMIC
+            pertoken_scale: Per-token scaling factor for W8A8_DYNAMIC / MXFP8
             bias: Bias
 
         Returns:
@@ -104,6 +130,30 @@ class CVLinearWrapper:
         """
         if self._has_communication:
             return self.linear.forward(quantized_x)
+
+        if self._is_mxfp8:
+            original_shape = quantized_x.shape
+            if quantized_x.dim() > 2:
+                quantized_x = quantized_x.view(-1, quantized_x.shape[-1])
+                if pertoken_scale is not None:
+                    pertoken_scale = pertoken_scale.view(-1, pertoken_scale.shape[-1])
+            if bias is not None and bias.dtype != torch.float32:
+                bias = bias.to(torch.float32)
+            output_dtype = getattr(self.linear, "params_dtype", None) or torch.bfloat16
+            output = torch_npu.npu_quant_matmul(
+                quantized_x,
+                self.linear.weight,
+                self.linear.weight_scale,
+                scale_dtype=torch_npu.float8_e8m0fnu,
+                pertoken_scale=pertoken_scale,
+                pertoken_scale_dtype=torch_npu.float8_e8m0fnu,
+                bias=bias,
+                output_dtype=output_dtype,
+                group_sizes=[1, 1, self._mxfp8_method.group_size],
+            )
+            if len(original_shape) > 2:
+                output = output.view(*original_shape[:-1], -1)
+            return output
 
         if self._is_w8a8_dynamic:
             need_unsqz = False
@@ -124,8 +174,7 @@ class CVLinearWrapper:
             if need_unsqz:
                 output = output.unsqueeze(dim=1)
             return output
-        else:
-            return self.linear.quant_method.apply(self.linear, quantized_x, bias)
+        return self.linear.quant_method.apply(self.linear, quantized_x, bias)
 
     def forward(self, x: torch.Tensor, bias=None):
         """Full forward (equivalent to the original Linear.forward)"""
