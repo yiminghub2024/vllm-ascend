@@ -27,6 +27,7 @@ from vllm.v1.attention.backend import (
     AttentionMetadataBuilder,
 )
 
+from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.dsa_v1 import dsv4_dsa_overlap_stream
 from vllm_ascend.core.deepseek_v41 import (
     DeepseekV41CompressorStateSpec,
@@ -47,6 +48,20 @@ from vllm_ascend.worker.device_metadata import (
 )
 
 V41_METADATA_BUFFER_SIZE = 1024
+
+
+def v41_multistream_preprocess_enabled() -> bool:
+    """Whether V4.1 should overlap Q Vector work with KV Cube work.
+
+    DSV4 turns overlap off on A5 when BF16 SparseFlashMla is selected, because
+    that plan's scatter is not stream-safe. V4.1 stores through
+    ``scatter_cache_sk`` (and, on 950, the dense remapped store), so it keeps
+    the config flag. The overlapped path is also how 950 MXFP8/MLAPO
+    activations are split: ``CVLinearWrapper`` quantizes with
+    ``npu_dynamic_mx_quant`` — the same Vector op A5 MLAPO uses before
+    ``npu_mla_prolog_v3`` — and matmuls on the Cube stream.
+    """
+    return bool(get_ascend_config().multistream_dsv4_dsa_overlap)
 
 
 @eager_break_during_capture
@@ -621,8 +636,7 @@ class DeepseekV41EagerAttentionImpl:
         metadata = self._get_layer_metadata(forward_context.attn_metadata)
         positions = metadata.positions[: hidden_states.shape[0]]
         cos, sin = metadata.rope(attn.rotary_emb.layername, hidden_states.shape[0])
-        v1_impl = attn.dsa_attn.dsa_attn.impl
-        preprocess = self.multistream_preprocess if v1_impl.multistream_dsv4_dsa_overlap else self.preprocess
+        preprocess = self.multistream_preprocess if v41_multistream_preprocess_enabled() else self.preprocess
         q, qr = preprocess(attn, hidden_states, cos, sin, metadata.swa)
         if self.role.is_kv_source:
             self._write_compressed_source(
