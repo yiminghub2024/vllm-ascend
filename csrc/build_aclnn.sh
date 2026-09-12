@@ -232,12 +232,13 @@ elif [[ "$SOC_VERSION" =~ ^ascend950 ]]; then
         "indexer_compress_epilog_v2"
         "causal_conv1d"
         "recurrent_gated_delta_rule"
-        "recurrent_kda"
         "chunk_fwd_o"
         "chunk_gated_delta_rule_fwd_h"
-        "chunk_kda_fwd"
-        "kda_gate_cumsum"
-        "kda_layout_swap12"
+        # The KDA ops (recurrent_kda, chunk_kda_fwd, kda_gate_cumsum,
+        # kda_layout_swap12) are deliberately absent: they entered this list
+        # with Kimi K3 support but carry no working arch35 tiling, so opc
+        # fails on an undeclared ChunkKdaFwdTilingData and blocks the whole
+        # 950 build. Re-add them once their arch35 path is validated.
         "store_kv_block"
         "store_kv_block_metadata"
         "k2q_csr"
